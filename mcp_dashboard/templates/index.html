@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Open-Claudio MCP Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { padding-top: 2rem; }
+        .tool-card { margin-bottom: 1.5rem; }
+        pre { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 5px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="row mb-4">
+        <div class="col">
+            <h1 class="display-5 fw-bold">Open-Claudio MCP Dashboard</h1>
+            <p class="lead">Connected to {{ tools|length }} tools across {{ servers|length }} MCP Servers.</p>
+        </div>
+    </div>
+
+    <div class="row">
+        <!-- Tools List -->
+        <div class="col-md-4">
+            <div class="list-group" id="toolList">
+                {% for tool in tools %}
+                <button type="button" class="list-group-item list-group-item-action" 
+                        onclick="selectTool(this)"
+                        data-name="{{ tool.name }}"
+                        data-schema="{{ tool.schema | tojson | forceescape }}">
+                    <strong>{{ tool.name }}</strong>
+                    <br>
+                    <small class="text-muted">{{ tool.server }}</small>
+                </button>
+                {% endfor %}
+            </div>
+        </div>
+
+        <!-- Tool Inspector -->
+        <div class="col-md-8">
+            <div class="card shadow-sm" id="toolInspector" style="display:none;">
+                <div class="card-header bg-primary text-white">
+                    <h5 class="mb-0" id="selectedToolName">Select a Tool</h5>
+                </div>
+                <div class="card-body">
+                    <h6>Schema Parameters:</h6>
+                    <pre id="toolSchema"></pre>
+                    <hr>
+                    
+                    <form id="executeForm">
+                        <div class="mb-3">
+                            <label for="jsonArgs" class="form-label">Arguments (JSON format)</label>
+                            <textarea class="form-control" id="jsonArgs" rows="3">{}</textarea>
+                            <div class="form-text">Type the JSON arguments exactly as the tool schema expects them.</div>
+                        </div>
+                        <button type="button" class="btn btn-success" onclick="runTool()">Execute Tool</button>
+                    </form>
+
+                    <h6 class="mt-4">Result:</h6>
+                    <pre id="toolResult" style="min-height: 100px;">Waiting for execution...</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    let currentTool = "";
+
+    function selectTool(btn) {
+        const name = btn.getAttribute('data-name');
+        const schema = JSON.parse(btn.getAttribute('data-schema'));
+        
+        currentTool = name;
+        document.getElementById('toolInspector').style.display = 'block';
+        document.getElementById('selectedToolName').textContent = name;
+        document.getElementById('toolSchema').textContent = JSON.stringify(schema, null, 2);
+        
+        // Auto-fill a dummy json payload if properties exist
+        let dummy = {};
+        if (schema && schema.properties) {
+            for (let prop in schema.properties) {
+                dummy[prop] = "";
+            }
+        }
+        document.getElementById('jsonArgs').value = JSON.stringify(dummy, null, 2);
+        document.getElementById('toolResult').textContent = "Waiting for execution...";
+    }
+
+    async function runTool() {
+        const resultBox = document.getElementById('toolResult');
+        resultBox.textContent = "Executing...";
+        
+        let args = {};
+        try {
+            args = JSON.parse(document.getElementById('jsonArgs').value);
+        } catch (e) {
+            resultBox.textContent = "Invalid JSON in arguments field.";
+            return;
+        }
+
+        try {
+            const res = await fetch('/api/call_tool', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tool_name: currentTool, arguments: args })
+            });
+            const data = await res.json();
+            resultBox.textContent = data.result;
+        } catch (e) {
+            resultBox.textContent = "Request Failed: " + e;
+        }
+    }
+</script>
+</body>
+</html>

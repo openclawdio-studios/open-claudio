@@ -13,10 +13,11 @@ logger = logging.getLogger("ReActAgent")
 # Configuration from environment or defaults
 LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "http://100.116.250.89:1234/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-oss-20b")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "not-needed")
 MCP_SERVER_URLS = os.getenv("MCP_SERVER_URLS", "http://mcp_domotics:8000/sse").split(",")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
 
-client = AsyncOpenAI(base_url=LLM_ENDPOINT, api_key="not-needed")
+client = AsyncOpenAI(base_url=LLM_ENDPOINT, api_key=LLM_API_KEY)
 
 def load_memory():
     try:
@@ -88,11 +89,16 @@ class ExtendedReActAgent:
         return f"Tool {name} not found."
 
     async def process_user_input(self, user_input: str) -> str:
-        system_prompt = f"""You are an advanced AI agent acting as the brain for Open-Claudio.
-You have access to tools via function calling.
-If the user asks for actions like opening blinds, use the available domotics tools.
-You have access to a memory of user preferences: {json.dumps(self.memory)}
-Reason carefully before acting. Reply directly with the final answer when you have gathered enough observation.
+        system_prompt = f"""You are 'Open-Claudio', an advanced AI home automation assistant.
+You have access to a set of internal and external tools via function calling.
+CRITICAL INSTRUCTIONS:
+1. You MUST use the provided tools to fulfill the user's request.
+2. DO NOT make up or hallucinate states. If the user asks you to open a blind or a door, YOU MUST CALL THE CORRESPONDING FUNCTION.
+3. If the user asks about Fermax devices, call `get_fermax_device_info` or `fermax_open_door`.
+4. If the user asks about Domotics or blinds (persianas), call `open_blinds` or `set_blinds_state`.
+5. Only reply directly without tool calls if you are just carrying out normal conversation.
+
+User Memory Context: {json.dumps(self.memory)}
 """
         messages = [
             {"role": "system", "content": system_prompt},
@@ -100,17 +106,23 @@ Reason carefully before acting. Reply directly with the final answer when you ha
         ]
         
         tools = self._build_openai_tools()
+        logger.debug(f"Sending {len(tools)} tools to LLM: {[t['function']['name'] for t in tools]}")
         
         for step in range(MAX_STEPS):
             logger.info(f"--- Step {step+1}/{MAX_STEPS} ---")
             
             try:
-                response = await client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=messages,
-                    tools=tools if tools else None,
-                    temperature=0.2
-                )
+                # Only pass tool_choice if tools are present
+                kwargs = {
+                    "model": MODEL_NAME,
+                    "messages": messages,
+                    "temperature": 0.2
+                }
+                if tools:
+                    kwargs["tools"] = tools
+                    kwargs["tool_choice"] = "auto"
+                    
+                response = await client.chat.completions.create(**kwargs)
             except Exception as e:
                 logger.error(f"LLM Call failed: {e}")
                 return f"Error communicating with LLM: {str(e)}"

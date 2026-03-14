@@ -27,6 +27,23 @@ services:
     networks:
       - claudio-net
 
+  mcp_dashboard:
+    build:
+      context: ./mcp_dashboard
+    container_name: open-claudio-dashboard
+    ports:
+      - "8082:8082"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MCP_SERVER_URLS=http://mcp_domotics:8000/sse,http://mcp_fermax:8001/sse
+    env_file:
+      - .env
+    depends_on:
+      - mcp_domotics
+      - mcp_fermax
+    networks:
+      - claudio-net
+
   agent:
     build:
       context: ./agent
@@ -37,6 +54,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - MCP_SERVER_URLS=http://mcp_domotics:8000/sse,http://mcp_fermax:8001/sse
+      - LLM_API_KEY=${LLM_API_KEY:-not-needed}
     env_file:
       - .env
     # Using tty/stdin_open to keep it interactive. We'll attach to it via `docker attach open-claudio-agent`

@@ -35,13 +35,26 @@ def _resolve_device_id(device: str) -> str | None:
     for k, v in DEVICE_MAPPING.items():
         if _normalize(k) == normalized_device:
             return v
+    
+    # Fuzzy match: e.g. "salon" inside "ventana salon"
+    for k, v in DEVICE_MAPPING.items():
+        if normalized_device in _normalize(k):
+            # To avoid returning multiple matches blindly, we just return the first hit.
+            # Usually users asking to close the salon mean Ventana Salon or Puerta Salon.
+            # Returning the first string match is better than failing for LLMs.
+            logger.info(f"Fuzzy matched '{device}' to '{k}'")
+            return v
             
     if device.startswith('ZWayVDev_'):
         return device
     return None
 
 def _send_command(device_id: str, action: str) -> bool:
-    url = f"{API_URL}/api/devices/{device_id}/command/{action}"
+    # Standard Z-Way API endpoint format:
+    # http://IP:8083/api/devices/{device_id}/command/{command}
+    # Notice we strip any trailing slashes from API_URL to avoid double slashes.
+    base_url = API_URL.rstrip('/')
+    url = f"{base_url}/api/devices/{device_id}/command/{action}"
     headers = {'Content-Type': 'application/json'}
     if API_TOKEN:
         headers['Authorization'] = f"Bearer {API_TOKEN}"
@@ -50,6 +63,9 @@ def _send_command(device_id: str, action: str) -> bool:
         res = requests.post(url, headers=headers, timeout=10)
         res.raise_for_status()
         return True
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP Error calling {url}: {e.response.text}")
+        return False
     except Exception as e:
         logger.error(f"Error calling {url}: {e}")
         return False
