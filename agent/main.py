@@ -4,7 +4,7 @@ import logging
 import os
 from openai import AsyncOpenAI
 from tools import LOCAL_TOOLS
-from mcp_client import DomoticsMCPClient
+from mcp_client import MultiMCPClient
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -13,7 +13,7 @@ logger = logging.getLogger("ReActAgent")
 # Configuration from environment or defaults
 LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "http://100.116.250.89:1234/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-oss-20b")
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://mcp_domotics:8000/sse")
+MCP_SERVER_URLS = os.getenv("MCP_SERVER_URLS", "http://mcp_domotics:8000/sse").split(",")
 MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
 
 client = AsyncOpenAI(base_url=LLM_ENDPOINT, api_key="not-needed")
@@ -31,7 +31,7 @@ def save_memory(memory):
 
 class ExtendedReActAgent:
     def __init__(self):
-        self.mcp_client = DomoticsMCPClient(server_url=MCP_SERVER_URL)
+        self.mcp_client = MultiMCPClient(server_urls=MCP_SERVER_URLS)
         self.memory = load_memory()
         
     async def initialize(self):

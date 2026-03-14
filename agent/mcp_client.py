@@ -1,61 +1,97 @@
 import asyncio
 import json
 import logging
-from typing import Dict, Any, Callable, List
+from typing import Dict, Any, List
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+from contextlib import AsyncExitStack
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("mcp_client")
 
-class DomoticsMCPClient:
-    def __init__(self, server_url: str = "http://mcp_domotics:8000/sse"):
-        self.server_url = server_url
-        self.session: ClientSession | None = None
-        self._exit_stack = None
-        self._tools_cache = []
+class MultiMCPClient:
+    def __init__(self, server_urls: List[str]):
+        """
+        Initializes a client capable of connecting to multiple MCP servers simultaneously.
+        """
+        self.server_urls = server_urls
+        # Maps server_url -> dict with connection state
+        self.connections: Dict[str, Dict[str, Any]] = {}
 
     async def connect(self):
-        """Connects to the MCP server using SSE."""
-        from contextlib import AsyncExitStack
-        self._exit_stack = AsyncExitStack()
-        
-        try:
-            sse_transport = await self._exit_stack.enter_async_context(sse_client(self.server_url))
-            self.session = await self._exit_stack.enter_async_context(ClientSession(*sse_transport))
-            await self.session.initialize()
-            logger.info(f"Connected to MCP Server at {self.server_url}")
-            
-            # Fetch tools on connect
-            response = await self.session.list_tools()
-            self._tools_cache = response.tools
-            logger.info(f"Loaded {len(self._tools_cache)} tools from MCP server.")
-            
-        except Exception as e:
-            logger.error(f"Failed to connect to MCP server at {self.server_url}: {e}")
-            if self._exit_stack:
-                await self._exit_stack.aclose()
-            self.session = None
+        """Connects to all configured MCP servers."""
+        for url in self.server_urls:
+            url = url.strip()
+            if not url:
+                continue
+                
+            logger.info(f"Attempting connection to MCP Server at {url}")
+            try:
+                # We manage the contexts manually to avoid AsyncExitStack issues on some Python/AnyIO versions.
+                from contextlib import asynccontextmanager
+                
+                sse_ctx = sse_client(url)
+                sse_transport = await sse_ctx.__aenter__()
+                
+                session_ctx = ClientSession(*sse_transport)
+                session = await session_ctx.__aenter__()
+                
+                await session.initialize()
+                
+                # Fetch tools on connect
+                response = await session.list_tools()
+                tools = response.tools
+                
+                logger.info(f"Successfully connected to {url}. Loaded {len(tools)} tools.")
+                
+                self.connections[url] = {
+                    "session": session,
+                    "session_ctx": session_ctx,
+                    "sse_ctx": sse_ctx,
+                    "tools": tools
+                }
+            except Exception as e:
+                logger.error(f"Failed to connect to MCP server at {url}: {e}")
 
     async def disconnect(self):
-        if self._exit_stack:
-            await self._exit_stack.aclose()
-            logger.info("Disconnected from MCP Server.")
+        """Disconnects from all servers."""
+        for url, conn in self.connections.items():
+            if "session_ctx" in conn:
+                try:
+                    await conn["session_ctx"].__aexit__(None, None, None)
+                except Exception as e:
+                    logger.error(f"Error closing session to {url}: {e}")
+            if "sse_ctx" in conn:
+                try:
+                    await conn["sse_ctx"].__aexit__(None, None, None)
+                except Exception as e:
+                    logger.error(f"Error closing sse transport to {url}: {e}")
+            logger.info(f"Disconnected from MCP Server at {url}")
+        self.connections.clear()
 
     def get_available_tools(self) -> List[Any]:
-        return self._tools_cache
+        """Returns a flat list of all tools from all connected servers."""
+        all_tools = []
+        for conn in self.connections.values():
+            all_tools.extend(conn.get("tools", []))
+        return all_tools
 
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
-        """Call a specific tool on the MCP server."""
-        if not self.session:
-            return f"Error: Not connected to MCP server (tried to call {name})"
-        
-        try:
-            logger.info(f"Calling MCP Tool: {name} with arguments {arguments}")
-            result = await self.session.call_tool(name, arguments=arguments)
-            # Assuming result.content is a list of TextContent or ImageContent
-            texts = [c.text for c in result.content if hasattr(c, 'text')]
-            return "\n".join(texts)
-        except Exception as e:
-            logger.error(f"Error calling MCP tool {name}: {e}")
-            return f"Error executing tool {name}: {str(e)}"
+        """Finds which server owns the tool and calls it."""
+        for url, conn in self.connections.items():
+            session: ClientSession = conn.get("session")
+            tools = conn.get("tools", [])
+            
+            # Check if this server has the requested tool
+            if any(t.name == name for t in tools):
+                try:
+                    logger.info(f"Routing call for '{name}' to {url} with args {arguments}")
+                    result = await session.call_tool(name, arguments=arguments)
+                    # Extract the text content from the MCP protocol response
+                    texts = [c.text for c in result.content if hasattr(c, 'text')]
+                    return "\n".join(texts)
+                except Exception as e:
+                    logger.error(f"Error calling MCP tool '{name}' on {url}: {e}")
+                    return f"Error executing tool {name} remotely: {str(e)}"
+                    
+        return f"Error: Tool '{name}' not found on any connected MCP server."

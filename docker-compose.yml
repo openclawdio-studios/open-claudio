@@ -14,14 +14,29 @@ services:
     networks:
       - claudio-net
 
+  mcp_fermax:
+    build:
+      context: ./mcp_fermax
+    container_name: open-claudio-fermax
+    ports:
+      - "8001:8001"
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
+    networks:
+      - claudio-net
+
   agent:
     build:
       context: ./agent
     container_name: open-claudio-agent
     depends_on:
       - mcp_domotics
+      - mcp_fermax
     environment:
       - PYTHONUNBUFFERED=1
+      - MCP_SERVER_URLS=http://mcp_domotics:8000/sse,http://mcp_fermax:8001/sse
     env_file:
       - .env
     # Using tty/stdin_open to keep it interactive. We'll attach to it via `docker attach open-claudio-agent`
