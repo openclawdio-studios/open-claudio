@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  mcp_domotics:
+    build:
+      context: ./mcp_domotics
+    container_name: open-claudio-domotics
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
+    networks:
+      - claudio-net
+
+  agent:
+    build:
+      context: ./agent
+    container_name: open-claudio-agent
+    depends_on:
+      - mcp_domotics
+    environment:
+      - PYTHONUNBUFFERED=1
+    env_file:
+      - .env
+    # Using tty/stdin_open to keep it interactive. We'll attach to it via `docker attach open-claudio-agent`
+    tty: true
+    stdin_open: true
+    networks:
+      - claudio-net
+
+networks:
+  claudio-net:
+    driver: bridge

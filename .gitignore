@@ -1,0 +1,34 @@
+# Environments
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+.env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+
+# Agent Memory
+# (Depends if you want memory.json checked in. Usually ignored in production)
+agent/memory.json
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code local settings
+.claude/settings.local.json
