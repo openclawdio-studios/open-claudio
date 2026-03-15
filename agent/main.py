@@ -134,12 +134,18 @@ async def main():
         print(f"Event sources active: {', '.join(active_sources)}")
 
     if sys.stdin.isatty():
-        # Interactive CLI mode
+        # Interactive CLI mode — only when stdin is truly readable (docker attach / local run)
         print("CLI ready. Type 'exit' to quit.\n")
         loop = asyncio.get_event_loop()
         try:
             while True:
-                user_in = await loop.run_in_executor(None, input, ">> ")
+                try:
+                    user_in = await loop.run_in_executor(None, input, ">> ")
+                except EOFError:
+                    # stdin closed (e.g. docker-compose up without attach) — fall back to daemon
+                    logger.info("stdin closed — switching to daemon mode.")
+                    await asyncio.gather(*service_tasks)
+                    break
                 if user_in.strip().lower() in ("exit", "quit"):
                     break
                 if not user_in.strip():
