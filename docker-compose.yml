@@ -86,8 +86,8 @@ services:
     networks:
       - claudio-net
 
-volumes:
-  # mosquitto_data:                             # Re-enable with mosquitto service
+# volumes:                                       # Re-enable with mosquitto service
+#   mosquitto_data:
 
 networks:
   claudio-net:
