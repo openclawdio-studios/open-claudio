@@ -11,12 +11,14 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import List, Optional
 
 from openai import AsyncOpenAI
 
 from tools import LOCAL_TOOLS
 from mcp_client import MultiMCPClient
+from db import recorder
 from tool_healing import (
     parse_tool_result,
     get_strategy,
@@ -81,6 +83,22 @@ class BaseAgent:
     def _mem(self) -> dict:
         """Return (and lazily create) the per-agent memory sub-dict."""
         return self.memory.setdefault(self.name, {})
+
+    # ------------------------------------------------------------------
+    # Tool source detection (for observability)
+    # ------------------------------------------------------------------
+
+    def _tool_source(self, name: str) -> str:
+        """Return which server/layer owns the tool (for DB recording)."""
+        if name in LOCAL_TOOLS:
+            return "local"
+        for url, conn in self.mcp_client.connections.items():
+            if any(t.name == name for t in conn.get("tools", [])):
+                try:
+                    return url.split("//")[1].split(":")[0]  # e.g. "mcp_domotics"
+                except Exception:
+                    return "mcp_unknown"
+        return "unknown"
 
     # ------------------------------------------------------------------
     # Tool building
@@ -168,81 +186,127 @@ class BaseAgent:
 
     async def _execute_tool(self, name: str, arguments: dict) -> str:
         """Execute a tool with self-healing: retry, LLM param correction, fix memory."""
-        mem_ns = self._mem()
-        original_arguments = dict(arguments)
+        # --- Observability tracking ---
+        _known_fix_applied = False
+        _retries = 0
+        _healing_strategy: Optional[str] = None
+        _success = False
+        _error_type: Optional[str] = None
+        _output = ""
+        tool_span_id = await recorder.start_span("tool_call", name)
+        t0 = time.monotonic()
 
-        # Step 1: Apply known fix from memory if available
-        fixed_args = lookup_known_fix(mem_ns, name, arguments)
-        if fixed_args is not None:
-            logger.info(f"[{self.name}] Applying known fix for '{name}': {arguments} → {fixed_args}")
-            arguments = fixed_args
+        try:
+            mem_ns = self._mem()
+            original_arguments = dict(arguments)
 
-        # Step 2: Execute and parse
-        raw = await self._raw_execute_tool(name, arguments)
-        result = parse_tool_result(raw)
-        record_metric(mem_ns, name, result.success, result.error_type)
+            # Step 1: Apply known fix from memory if available
+            fixed_args = lookup_known_fix(mem_ns, name, arguments)
+            if fixed_args is not None:
+                logger.info(f"[{self.name}] Applying known fix for '{name}': {arguments} → {fixed_args}")
+                arguments = fixed_args
+                _known_fix_applied = True
 
-        if result.success:
-            return result.content
+            # Step 2: Execute and parse
+            raw = await self._raw_execute_tool(name, arguments)
+            result = parse_tool_result(raw)
+            record_metric(mem_ns, name, result.success, result.error_type)
 
-        # Step 3: Determine healing strategy
-        strategy = get_strategy(result.error_type)
-        logger.warning(
-            f"[{self.name}] Tool '{name}' failed "
-            f"(type={result.error_type}, strategy={strategy}): {result.content}"
-        )
+            if result.success:
+                _success, _output = True, result.content
+                return result.content
 
-        # --- Strategy: retry (connection / timeout errors) ---
-        if strategy in ("retry", "retry_then_report"):
-            for attempt in range(1, MAX_HEAL_RETRIES + 1):
-                logger.info(f"[{self.name}] Retry {attempt}/{MAX_HEAL_RETRIES} for '{name}'")
-                await asyncio.sleep(1.5 * attempt)
-                raw = await self._raw_execute_tool(name, arguments)
-                result = parse_tool_result(raw)
-                record_metric(mem_ns, name, result.success, result.error_type)
-                if result.success:
-                    return result.content
-            return f"Tool '{name}' failed after {MAX_HEAL_RETRIES} retries: {result.content}"
+            # Step 3: Determine healing strategy
+            strategy = get_strategy(result.error_type)
+            _error_type = result.error_type
+            logger.warning(
+                f"[{self.name}] Tool '{name}' failed "
+                f"(type={result.error_type}, strategy={strategy}): {result.content}"
+            )
 
-        # --- Strategy: llm_fix (validation errors) ---
-        if strategy == "llm_fix":
-            repair_prompt = build_repair_prompt(name, arguments, result)
-            logger.info(f"[{self.name}] Requesting LLM to fix params for '{name}'")
-            try:
-                fix_response = await self.llm_client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": repair_prompt}],
-                    temperature=0.0,
-                )
-                fix_text = fix_response.choices[0].message.content or ""
-                new_args = parse_llm_fix(fix_text)
-
-                if new_args and new_args != arguments:
-                    logger.info(f"[{self.name}] LLM suggested fix: {arguments} → {new_args}")
-                    raw = await self._raw_execute_tool(name, new_args)
+            # --- Strategy: retry (connection / timeout errors) ---
+            if strategy in ("retry", "retry_then_report"):
+                _healing_strategy = "retry"
+                for attempt in range(1, MAX_HEAL_RETRIES + 1):
+                    _retries += 1
+                    logger.info(f"[{self.name}] Retry {attempt}/{MAX_HEAL_RETRIES} for '{name}'")
+                    await asyncio.sleep(1.5 * attempt)
+                    raw = await self._raw_execute_tool(name, arguments)
                     result = parse_tool_result(raw)
                     record_metric(mem_ns, name, result.success, result.error_type)
                     if result.success:
-                        # Record the fix in the per-agent memory namespace
-                        record_fix(mem_ns, name, original_arguments, new_args)
+                        _success, _output = True, result.content
                         return result.content
-                    else:
-                        return f"Tool '{name}' still failed after LLM correction: {result.content}"
-                else:
-                    logger.warning(f"[{self.name}] LLM could not suggest a valid fix.")
-            except Exception as e:
-                logger.error(f"[{self.name}] LLM fix call failed: {e}")
+                _output = f"Tool '{name}' failed after {MAX_HEAL_RETRIES} retries: {result.content}"
+                return _output
 
-        # --- Strategy: report (permission errors, tool_not_found, unrecoverable) ---
-        if result.error_type == "tool_not_found" and result.raw and isinstance(result.raw, dict):
-            avail = result.raw.get("available_tools", [])
-            if avail:
-                return (
-                    f"Tool '{name}' does not exist. "
-                    f"Available tools: {', '.join(avail)}. "
-                    f"Please use one of the available tools instead."
-                )
-        return f"Tool '{name}' error ({result.error_type}): {result.content}"
+            # --- Strategy: llm_fix (validation errors) ---
+            if strategy == "llm_fix":
+                _healing_strategy = "llm_fix"
+                repair_prompt = build_repair_prompt(name, arguments, result)
+                logger.info(f"[{self.name}] Requesting LLM to fix params for '{name}'")
+                try:
+                    fix_response = await self.llm_client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": repair_prompt}],
+                        temperature=0.0,
+                    )
+                    fix_text = fix_response.choices[0].message.content or ""
+                    new_args = parse_llm_fix(fix_text)
+
+                    if new_args and new_args != arguments:
+                        logger.info(f"[{self.name}] LLM suggested fix: {arguments} → {new_args}")
+                        raw = await self._raw_execute_tool(name, new_args)
+                        result = parse_tool_result(raw)
+                        record_metric(mem_ns, name, result.success, result.error_type)
+                        if result.success:
+                            record_fix(mem_ns, name, original_arguments, new_args)
+                            await recorder.upsert_tool_fix(
+                                self.name, name, original_arguments, new_args
+                            )
+                            _success, _output = True, result.content
+                            return result.content
+                        else:
+                            _output = f"Tool '{name}' still failed after LLM correction: {result.content}"
+                            return _output
+                    else:
+                        logger.warning(f"[{self.name}] LLM could not suggest a valid fix.")
+                except Exception as e:
+                    logger.error(f"[{self.name}] LLM fix call failed: {e}")
+
+            # --- Strategy: report ---
+            if result.error_type == "tool_not_found" and result.raw and isinstance(result.raw, dict):
+                avail = result.raw.get("available_tools", [])
+                if avail:
+                    _output = (
+                        f"Tool '{name}' does not exist. "
+                        f"Available tools: {', '.join(avail)}. "
+                        f"Please use one of the available tools instead."
+                    )
+                    return _output
+            _output = f"Tool '{name}' error ({result.error_type}): {result.content}"
+            return _output
+
+        finally:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            await recorder.record_tool_call(
+                span_id=tool_span_id,
+                tool_name=name,
+                tool_source=self._tool_source(name),
+                input_args=original_arguments if "original_arguments" in dir() else arguments,
+                output=_output,
+                success=_success,
+                error_type=_error_type,
+                healing_strategy=_healing_strategy,
+                retries=_retries,
+                known_fix_applied=_known_fix_applied,
+                duration_ms=duration_ms,
+            )
+            await recorder.complete_span(
+                tool_span_id,
+                "ok" if _success else "error",
+                duration_ms=duration_ms,
+            )
 
     # ------------------------------------------------------------------
     # ReAct loop
@@ -250,6 +314,30 @@ class BaseAgent:
 
     async def run(self, task: str) -> str:
         """Run the ReAct loop for a given task and return the final answer."""
+        # --- Observability: agent_run span ---
+        agent_span_id = await recorder.start_span("agent_run", self.name)
+        parent_token = recorder.set_parent_span_id(agent_span_id)
+        t_agent = time.monotonic()
+
+        try:
+            result = await self._react_loop(task, agent_span_id)
+            await recorder.complete_span(
+                agent_span_id, "ok",
+                duration_ms=int((time.monotonic() - t_agent) * 1000),
+            )
+            return result
+        except Exception as exc:
+            await recorder.complete_span(
+                agent_span_id, "error",
+                error_message=str(exc),
+                duration_ms=int((time.monotonic() - t_agent) * 1000),
+            )
+            raise
+        finally:
+            recorder.reset_parent_span_id(parent_token)
+
+    async def _react_loop(self, task: str, agent_span_id: Optional[str]) -> str:
+        """Inner ReAct loop — separated so run() can cleanly manage the span."""
         tools = self._build_tools()
         tool_names = [t["function"]["name"] for t in tools]
         tool_list_str = ", ".join(f"`{n}`" for n in tool_names)
@@ -284,6 +372,8 @@ class BaseAgent:
         for step in range(MAX_STEPS):
             logger.info(f"[{self.name}] --- Step {step + 1}/{MAX_STEPS} ---")
 
+            llm_span_id = await recorder.start_span("llm_call", f"{self.name}:step{step + 1}")
+            t_llm = time.monotonic()
             try:
                 kwargs = {
                     "model": self.model,
@@ -295,11 +385,30 @@ class BaseAgent:
                     kwargs["tool_choice"] = "auto"
 
                 response = await self.llm_client.chat.completions.create(**kwargs)
+                llm_duration = int((time.monotonic() - t_llm) * 1000)
             except Exception as e:
+                llm_duration = int((time.monotonic() - t_llm) * 1000)
+                await recorder.complete_span(llm_span_id, "error", str(e), llm_duration)
                 logger.error(f"[{self.name}] LLM call failed: {e}")
                 return f"Error communicating with LLM: {str(e)}"
 
             message = response.choices[0].message
+            usage = response.usage
+            stop_reason = "tool_calls" if message.tool_calls else "stop"
+
+            await recorder.record_llm_call(
+                span_id=llm_span_id,
+                model=self.model,
+                messages=messages,
+                response=message.content or "",
+                tokens_prompt=usage.prompt_tokens if usage else None,
+                tokens_completion=usage.completion_tokens if usage else None,
+                temperature=0.2,
+                stop_reason=stop_reason,
+                duration_ms=llm_duration,
+            )
+            await recorder.complete_span(llm_span_id, "ok", duration_ms=llm_duration)
+
             messages.append(message)
 
             if message.tool_calls:

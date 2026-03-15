@@ -3,12 +3,15 @@ import json
 import logging
 import os
 import sys
+import time
 from openai import AsyncOpenAI
+from db import recorder
 from mcp_client import MultiMCPClient
 from agents.home_agent import make_home_agent
 from agents.server_agent import make_server_agent
 from agents.intercom_agent import make_intercom_agent
 from agents.utility_agent import make_utility_agent
+from agents.knowledge_agent import make_knowledge_agent
 from agents.planner_agent import PlannerAgent
 from event_worker import EventWorker
 
@@ -54,9 +57,10 @@ class OpenClaudio:
         self.agents: dict = {}
 
     async def initialize(self):
-        """Connect to all MCP servers and instantiate all agents."""
+        """Connect to all MCP servers, instantiate agents, and init DB recorder."""
         logger.info("Connecting to MCP servers...")
         await self.mcp_client.connect()
+        await recorder.init()
 
         logger.info("Instantiating domain agents...")
         shared = dict(
@@ -66,17 +70,38 @@ class OpenClaudio:
             model=MODEL_NAME,
         )
         self.agents = {
-            "home":     make_home_agent(**shared),
-            "server":   make_server_agent(**shared),
-            "intercom": make_intercom_agent(**shared),
-            "utility":  make_utility_agent(**shared),
+            "home":      make_home_agent(**shared),
+            "server":    make_server_agent(**shared),
+            "intercom":  make_intercom_agent(**shared),
+            "utility":   make_utility_agent(**shared),
+            "knowledge": make_knowledge_agent(**shared),
         }
         self.planner = PlannerAgent(agents=self.agents, llm_client=llm_client, model=MODEL_NAME)
         logger.info("OpenClaudio initialized. Agents: %s", list(self.agents.keys()))
 
-    async def process(self, user_input: str) -> str:
-        """Delegate the user request to the planner."""
-        return await self.planner.run(user_input)
+    async def process(self, user_input: str, source: str = "cli") -> str:
+        """Delegate the user request to the planner, wrapped in a DB trace."""
+        t0 = time.monotonic()
+        trace_id = await recorder.start_trace(source=source, user_input=user_input)
+        recorder.set_trace_id(trace_id) if trace_id else None
+
+        status = "success"
+        result = ""
+        try:
+            result = await self.planner.run(user_input)
+            return result
+        except Exception as exc:
+            status = "error"
+            result = str(exc)
+            raise
+        finally:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            await recorder.complete_trace(
+                trace_id=trace_id,
+                output=result,
+                status=status,
+                duration_ms=duration_ms,
+            )
 
     async def shutdown(self):
         """Disconnect from MCP servers and persist memory."""

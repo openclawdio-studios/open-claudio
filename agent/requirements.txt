@@ -6,3 +6,6 @@ aiomqtt
 aiogram
 fastapi
 uvicorn
+sqlalchemy[asyncio]>=2.0
+asyncpg
+greenlet

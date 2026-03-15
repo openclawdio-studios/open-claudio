@@ -1,0 +1,8 @@
+mcp[cli]
+fastmcp
+uvicorn
+chromadb>=0.5
+sentence-transformers>=3.0
+rank-bm25
+pymupdf
+einops

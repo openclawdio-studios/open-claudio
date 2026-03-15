@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from datetime import datetime
@@ -5,6 +6,7 @@ from typing import Any, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from event_queue import Event, get_queue
@@ -55,6 +57,49 @@ async def receive_event(
     await get_queue().put(event)
     logger.info(f"HTTP <- topic='{body.topic}' payload={body.payload}")
     return {"status": "queued", "topic": body.topic, "event_type": body.event_type}
+
+
+class QueryRequest(BaseModel):
+    message: str
+    source: str = "web"
+
+
+@app.post("/query", summary="Send a query and wait for the agent response (synchronous)")
+async def query_agent(
+    body: QueryRequest,
+    authorization: Optional[str] = Header(None),
+):
+    if authorization != f"Bearer {HTTP_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+
+    async def reply_fn(result: str):
+        if not future.done():
+            future.set_result(result)
+
+    event = Event(
+        source="web",
+        event_type="query",
+        topic="http/webhook",
+        payload={"text": body.message},
+        timestamp=datetime.now(),
+        metadata={"source": body.source},
+        reply_fn=reply_fn,
+    )
+
+    await get_queue().put(event)
+    logger.info(f"HTTP /query <- message='{body.message[:60]}'")
+
+    try:
+        result = await asyncio.wait_for(asyncio.shield(future), timeout=120.0)
+        return {"status": "ok", "response": result}
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=408,
+            content={"status": "timeout", "response": "Agent did not respond within 120 seconds."},
+        )
 
 
 @app.get("/health", summary="Health check")

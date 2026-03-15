@@ -6,11 +6,13 @@ and returns a combined result.
 
 import json
 import logging
+import time
 from typing import Dict, List
 
 from openai import AsyncOpenAI
 
 from agents.base_agent import BaseAgent
+from db import recorder
 
 logger = logging.getLogger("PlannerAgent")
 
@@ -20,10 +22,12 @@ Your job is to decompose the user's request into an ordered list of sub-tasks,
 each assigned to the most appropriate specialist agent.
 
 Available agents and their domains:
-- "home"     : blinds, shutters (persianas), opening the front door via intercom
-- "server"   : reading files, listing directories, making HTTP requests, server diagnostics
-- "intercom" : Fermax intercom account info, device status, call history
-- "utility"  : current time, generic HTTP lookups, anything that doesn't fit elsewhere
+- "home"      : blinds, shutters (persianas), opening the front door via intercom
+- "server"    : reading files, listing directories, making HTTP requests, server diagnostics
+- "intercom"  : Fermax intercom account info, device status, call history
+- "utility"   : current time, generic HTTP lookups, anything that doesn't fit elsewhere
+- "knowledge" : documentation lookup, device manuals, how-to guides, user preferences,
+                any question that requires searching stored knowledge or the knowledge base
 
 OUTPUT RULES — follow them exactly:
 1. Output ONLY a valid JSON array. No markdown fences, no explanation, no preamble.
@@ -39,6 +43,15 @@ Output: [{"agent": "utility", "task": "What is the current time?"}]
 
 User: "Close all the blinds."
 Output: [{"agent": "home", "task": "Close all the blinds (set_all_blinds_state to closed)."}]
+
+User: "How do I configure the bedroom blind?"
+Output: [{"agent": "knowledge", "task": "Search the knowledge base for documentation on configuring the bedroom blind."}]
+
+User: "Look up the blind manual and then close the bedroom blind."
+Output: [
+  {"agent": "knowledge", "task": "Search the knowledge base for blind manual or configuration docs."},
+  {"agent": "home", "task": "Close the bedroom blind (Ventana Hab. Principal)."}
+]
 
 User: "Open the front door and then tell me the last intercom call."
 Output: [
@@ -95,14 +108,31 @@ class PlannerAgent:
 
         Falls back to a single utility step if JSON parsing fails.
         """
+        span_id = await recorder.start_span("planner", "planner")
+        token = recorder.set_parent_span_id(span_id)
+        messages = [
+            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+            {"role": "user", "content": task},
+        ]
+        t0 = time.monotonic()
         try:
             response = await self.llm_client.chat.completions.create(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
-                    {"role": "user", "content": task},
-                ],
+                messages=messages,
                 temperature=0.0,
+            )
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            usage = response.usage
+            await recorder.record_llm_call(
+                span_id=span_id,
+                model=self.model,
+                messages=messages,
+                response=(response.choices[0].message.content or ""),
+                tokens_prompt=usage.prompt_tokens if usage else None,
+                tokens_completion=usage.completion_tokens if usage else None,
+                temperature=0.0,
+                stop_reason="stop",
+                duration_ms=duration_ms,
             )
             raw = (response.choices[0].message.content or "").strip()
 
@@ -124,13 +154,19 @@ class PlannerAgent:
                 and len(plan) > 0
             ):
                 logger.info(f"PlannerAgent produced {len(plan)} step(s): {plan}")
+                await recorder.complete_span(span_id, "ok")
                 return plan
 
             logger.warning(f"PlannerAgent returned unexpected structure: {plan!r}")
+            await recorder.complete_span(span_id, "error", "unexpected structure")
         except json.JSONDecodeError as e:
             logger.warning(f"PlannerAgent JSON parse error: {e}")
+            await recorder.complete_span(span_id, "error", str(e))
         except Exception as e:
             logger.error(f"PlannerAgent plan() failed: {e}")
+            await recorder.complete_span(span_id, "error", str(e))
+        finally:
+            recorder.reset_parent_span_id(token)
 
         # Safe fallback — send everything to the utility agent
         fallback = [{"agent": "utility", "task": task}]
@@ -147,6 +183,21 @@ class PlannerAgent:
         Returns a combined result string.
         """
         steps = await self.plan(task)
+
+        # Persist the plan on the trace
+        trace_id = recorder.get_trace_id()
+        if trace_id:
+            try:
+                from db.connection import AsyncSessionFactory
+                from db.models import Trace
+                async with AsyncSessionFactory() as session:
+                    async with session.begin():
+                        row = await session.get(Trace, trace_id)
+                        if row:
+                            row.agent_plan = steps
+            except Exception:
+                pass
+
         results = []
 
         for step in steps:
