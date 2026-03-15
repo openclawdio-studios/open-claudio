@@ -65,7 +65,7 @@ services:
       - mcp_fermax
       # - mosquitto                             # Re-enable when mosquitto service is active
     ports:
-      - "8080:8080"
+      - "8085:8080"
     environment:
       - PYTHONUNBUFFERED=1
       - MCP_SERVER_URLS=http://mcp_domotics:8000/sse,http://mcp_fermax:8001/sse
