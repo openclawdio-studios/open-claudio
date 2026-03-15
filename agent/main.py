@@ -93,11 +93,11 @@ def _build_event_tasks(oc: OpenClaudio) -> list:
     worker = EventWorker(planner=oc.planner, agents=oc.agents)
     tasks.append(worker.run())
 
-    # MQTT source — enabled if MQTT_HOST is set
-    if os.getenv("MQTT_HOST"):
+    # MQTT source — enabled only if MQTT_ENABLED=true (MQTT_HOST is config, not a feature flag)
+    if os.getenv("MQTT_ENABLED", "").lower() == "true":
         from sources.mqtt_source import MQTTSource
         tasks.append(MQTTSource().run())
-        logger.info("MQTTSource enabled (MQTT_HOST=%s)", os.getenv("MQTT_HOST"))
+        logger.info("MQTTSource enabled (MQTT_HOST=%s)", os.getenv("MQTT_HOST", "mosquitto"))
 
     # Telegram source — enabled if TELEGRAM_BOT_TOKEN is set
     if os.getenv("TELEGRAM_BOT_TOKEN"):
@@ -123,7 +123,7 @@ async def main():
     service_tasks = [asyncio.create_task(coro) for coro in _build_event_tasks(oc)]
 
     active_sources = []
-    if os.getenv("MQTT_HOST"):
+    if os.getenv("MQTT_ENABLED", "").lower() == "true":
         active_sources.append("MQTT")
     if os.getenv("TELEGRAM_BOT_TOKEN"):
         active_sources.append("Telegram")

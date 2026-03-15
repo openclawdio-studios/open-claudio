@@ -70,6 +70,7 @@ services:
       - PYTHONUNBUFFERED=1
       - MCP_SERVER_URLS=http://mcp_domotics:8000/sse,http://mcp_fermax:8001/sse
       - LLM_API_KEY=${LLM_API_KEY:-not-needed}
+      # - MQTT_ENABLED=true                      # Uncomment to enable MQTT source
       # - MQTT_HOST=mosquitto                   # Uncomment when mosquitto service is active
       # - MQTT_PORT=1883
       # Uncomment to enable sources:
