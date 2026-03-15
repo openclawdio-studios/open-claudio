@@ -2,3 +2,7 @@ openai
 mcp
 pydantic
 requests
+aiomqtt
+aiogram
+fastapi
+uvicorn

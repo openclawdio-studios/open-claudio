@@ -1,6 +1,18 @@
 version: '3.8'
 
 services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: open-claudio-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mosquitto_data:/mosquitto/data
+    networks:
+      - claudio-net
+    restart: unless-stopped
+
   mcp_domotics:
     build:
       context: ./mcp_domotics
@@ -51,19 +63,31 @@ services:
     depends_on:
       - mcp_domotics
       - mcp_fermax
+      - mosquitto
+    ports:
+      - "8080:8080"
     environment:
       - PYTHONUNBUFFERED=1
       - MCP_SERVER_URLS=http://mcp_domotics:8000/sse,http://mcp_fermax:8001/sse
       - LLM_API_KEY=${LLM_API_KEY:-not-needed}
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+      # Uncomment to enable sources:
+      # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      # - TELEGRAM_ALLOWED_CHAT_IDS=${TELEGRAM_ALLOWED_CHAT_IDS}
+      # - HTTP_EVENT_ENABLED=true
+      # - HTTP_EVENT_SECRET=${HTTP_EVENT_SECRET}
     env_file:
       - .env
     volumes:
       - ./agent/memory.json:/app/memory.json
-    # Using tty/stdin_open to keep it interactive. We'll attach to it via `docker attach open-claudio-agent`
     tty: true
     stdin_open: true
     networks:
       - claudio-net
+
+volumes:
+  mosquitto_data:
 
 networks:
   claudio-net:
