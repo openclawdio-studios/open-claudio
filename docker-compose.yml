@@ -76,8 +76,8 @@ services:
       # Uncomment to enable sources:
       # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       # - TELEGRAM_ALLOWED_CHAT_IDS=${TELEGRAM_ALLOWED_CHAT_IDS}
-      # - HTTP_EVENT_ENABLED=true
-      # - HTTP_EVENT_SECRET=${HTTP_EVENT_SECRET}
+      - HTTP_EVENT_ENABLED=true
+      - HTTP_EVENT_SECRET=${HTTP_EVENT_SECRET}
     env_file:
       - .env
     volumes:
