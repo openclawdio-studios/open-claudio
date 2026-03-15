@@ -19,14 +19,15 @@ class EventWorker:
         self._running = False
 
     def _build_task(self, route, event: Event) -> str:
-        safe_payload = {k: v for k, v in event.payload.items() if isinstance(k, str)}
+        # Build kwargs with defaults first, then let payload keys override — no duplicates
+        kwargs = {
+            "topic": event.topic,
+            "payload": event.payload,
+            "text": event.payload.get("text", str(event.payload)),
+        }
+        kwargs.update({k: v for k, v in event.payload.items() if isinstance(k, str)})
         try:
-            return route.task_template.format(
-                topic=event.topic,
-                payload=event.payload,
-                text=event.payload.get("text", str(event.payload)),
-                **safe_payload,
-            )
+            return route.task_template.format(**kwargs)
         except (KeyError, IndexError):
             return route.task_template
 
