@@ -1,17 +1,17 @@
 version: '3.8'
 
 services:
-  mosquitto:
-    image: eclipse-mosquitto:2
-    container_name: open-claudio-mosquitto
-    ports:
-      - "1883:1883"
-    volumes:
-      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
-      - mosquitto_data:/mosquitto/data
-    networks:
-      - claudio-net
-    restart: unless-stopped
+  # mosquitto:                                  # DISABLED — image pull issue (Cloudflare R2 connectivity)
+  #   image: eclipse-mosquitto:2               # Re-enable when network access is restored or use
+  #   container_name: open-claudio-mosquitto   # Option B: install Mosquitto on the host and set
+  #   ports:                                   # MQTT_HOST=host.docker.internal in .env
+  #     - "1883:1883"
+  #   volumes:
+  #     - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+  #     - mosquitto_data:/mosquitto/data
+  #   networks:
+  #     - claudio-net
+  #   restart: unless-stopped
 
   mcp_domotics:
     build:
@@ -63,15 +63,15 @@ services:
     depends_on:
       - mcp_domotics
       - mcp_fermax
-      - mosquitto
+      # - mosquitto                             # Re-enable when mosquitto service is active
     ports:
       - "8080:8080"
     environment:
       - PYTHONUNBUFFERED=1
       - MCP_SERVER_URLS=http://mcp_domotics:8000/sse,http://mcp_fermax:8001/sse
       - LLM_API_KEY=${LLM_API_KEY:-not-needed}
-      - MQTT_HOST=mosquitto
-      - MQTT_PORT=1883
+      # - MQTT_HOST=mosquitto                   # Uncomment when mosquitto service is active
+      # - MQTT_PORT=1883
       # Uncomment to enable sources:
       # - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       # - TELEGRAM_ALLOWED_CHAT_IDS=${TELEGRAM_ALLOWED_CHAT_IDS}
@@ -87,7 +87,7 @@ services:
       - claudio-net
 
 volumes:
-  mosquitto_data:
+  # mosquitto_data:                             # Re-enable with mosquitto service
 
 networks:
   claudio-net:
