@@ -1,0 +1,157 @@
+# Self-Healing Tool Layer for Open-Claudio
+
+Añadir una capa de resiliencia al agente para que, cuando una tool falle, el sistema clasifique el error, aplique estrategias de reparación (retry, corrección de parámetros vía LLM, fallback) y aprenda de las correcciones exitosas.
+
+## Proposed Changes
+
+### Agent — Nuevo módulo de healing
+
+#### [NEW] [tool_healing.py](file:///c:/ws/open-claudio/agent/tool_healing.py)
+
+Módulo central con la lógica de self-healing:
+
+```python
+# Clasificación de errores
+ERROR_TYPES = {
+    "connection_error",   # red / servidor caído → retry automático
+    "timeout",            # API no responde → retry con backoff
+    "validation_error",   # parámetros incorrectos → LLM corrige
+    "permission_error",   # credenciales → informar al usuario
+    "tool_not_found",     # tool inexistente → informar al usuario
+    "unknown_error"       # fallback
+}
+
+# Estrategias por tipo
+STRATEGIES = {
+    "connection_error": "retry",
+    "timeout":          "retry",
+    "validation_error": "llm_fix",
+    "permission_error": "report",
+    "tool_not_found":   "report",
+    "unknown_error":    "retry_then_report"
+}
+```
+
+Funcionalidades:
+1. **`parse_tool_result(raw_result)`** — Detecta si el resultado es un error estructurado (JSON con `status: "error"`) o un string con patrón `"Error: ..."`. Devuelve un `ToolResult` normalizado.
+2. **`classify_error(result)`** — Mapea mensajes de error a `ERROR_TYPES` usando keywords (e.g. "timeout", "connection", "permission", "not found", "validation").
+3. **`build_repair_prompt(tool_name, arguments, error)`** — Genera un prompt para el LLM pidiendo corrección de parámetros.
+4. **`record_fix(memory, tool_name, original_args, fixed_args)`** — Guarda en `memory["tool_fixes"]` las correcciones exitosas.
+5. **`lookup_known_fix(memory, tool_name, arguments)`** — Antes de ejecutar, busca si hay un fix previo aplicable (e.g. `"livingroom"` → `"salon"`).
+
+---
+
+### MCP Servers — Errores estructurados
+
+#### [MODIFY] [server.py](file:///c:/ws/open-claudio/mcp_domotics/server.py)
+
+Cambiar los `return f"Error: ..."` por respuestas JSON estructuradas:
+
+```diff
+-return f"Error: unknown device '{room}'. Available: {available}"
++return json.dumps({
++    "status": "error",
++    "error_type": "validation_error",
++    "message": f"Unknown device '{room}'",
++    "available_values": list(DEVICE_MAPPING.keys())
++})
+```
+
+Aplicar el mismo patrón a [_send_command](file:///c:/ws/open-claudio/mcp_domotics/server.py#55-74) failures (→ `connection_error`) y acciones inválidas (→ `validation_error`).
+
+#### [MODIFY] [server.py](file:///c:/ws/open-claudio/mcp_fermax/server.py)
+
+Misma normalización: `permission_error` para fallos de auth, `connection_error` para fallos de red, etc.
+
+---
+
+### Agent — Integrar healing en el executor
+
+#### [MODIFY] [main.py](file:///c:/ws/open-claudio/agent/main.py)
+
+Reemplazar [_execute_tool](file:///c:/ws/open-claudio/agent/main.py#72-90) con `_execute_tool_with_healing`:
+
+```
+Flujo:
+1. lookup_known_fix() → aplica fix previo si existe
+2. Ejecuta tool (local o MCP)
+3. parse_tool_result() → ¿es error?
+4. Si no es error → devolver resultado
+5. Si es error:
+   a. classify_error()
+   b. Si "retry" → reintentar hasta 2 veces con backoff
+   c. Si "llm_fix" → build_repair_prompt() → llamar al LLM → parsear params → reintentar
+   d. Si "report" → devolver error al usuario
+6. Si el fix funcionó → record_fix() en memoria
+```
+
+Cambios concretos:
+- Importar `tool_healing`
+- Añadir `MAX_HEAL_RETRIES = 2` como configuración
+- El system prompt no necesita cambios — el healing es transparente
+
+#### [MODIFY] [mcp_client.py](file:///c:/ws/open-claudio/agent/mcp_client.py)
+
+Añadir retry con backoff en [call_tool()](file:///c:/ws/open-claudio/agent/mcp_client.py#79-98) para errores de conexión (el server MCP puede estar reiniciándose):
+
+```diff
++import asyncio
++MAX_CALL_RETRIES = 2
+
+ async def call_tool(self, name, arguments):
+     for url, conn in self.connections.items():
+         if any(t.name == name for t in conn["tools"]):
++            for attempt in range(MAX_CALL_RETRIES + 1):
+                 try:
+                     result = await session.call_tool(name, arguments=arguments)
+                     ...
+                     return text
+                 except Exception as e:
++                    if attempt < MAX_CALL_RETRIES:
++                        await asyncio.sleep(1 * (attempt + 1))
++                        continue
+                     return error_json
+```
+
+---
+
+### Memory — Persistent fix learning
+
+La estructura de [memory.json](file:///c:/ws/open-claudio/agent/memory.json) se extiende con:
+
+```json
+{
+  "tool_fixes": [
+    {
+      "tool": "set_blinds_state",
+      "original": {"room": "livingroom"},
+      "fixed": {"room": "Ventana Salon"},
+      "timestamp": "2026-03-15T11:40:00"
+    }
+  ],
+  "tool_metrics": {
+    "set_blinds_state": {"calls": 15, "errors": 1, "last_error": null},
+    "fermax_open_door": {"calls": 3, "errors": 0, "last_error": null}
+  }
+}
+```
+
+## Verification Plan
+
+### Automated Tests
+
+Se creará un script de test `agent/test_healing.py` que:
+
+1. **Simula errores estructurados** — Verifica que `parse_tool_result` y `classify_error` clasifican correctamente errores JSON y strings
+2. **Simula retry** — Mock de una tool que falla 2 veces y luego tiene éxito
+3. **Simula conocimiento previo** — Verifica que `lookup_known_fix` aplica correcciones de la memoria
+
+```bash
+# Ejecutar desde el contenedor del agent o localmente con las deps instaladas:
+cd agent && python test_healing.py
+```
+
+### Manual Verification
+
+> [!IMPORTANT]
+> Como el sistema depende de un LLM externo (LM Studio) y dispositivos IoT reales, la corrección de parámetros vía LLM solo se puede verificar completamente en el entorno real con `docker-compose up --build`. Te pediré que lo pruebes enviando un comando con un parámetro incorrecto (ej: "abre la persiana del living room") y verificando que el agente lo corrige automáticamente.

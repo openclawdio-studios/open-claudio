@@ -1,6 +1,7 @@
 from fastmcp import FastMCP
 import uvicorn
 import logging
+import json
 import os
 import requests
 import unicodedata
@@ -52,8 +53,16 @@ def _resolve_device_id(device: str) -> str | None:
         return device
     return None
 
-def _send_command(device_id: str, action: str) -> bool:
-    """Send a Z-Wave command to the device via the home automation API (GET request)."""
+def _error_response(error_type: str, message: str, **extra) -> str:
+    """Return a structured JSON error string for the self-healing layer."""
+    payload = {"status": "error", "error_type": error_type, "message": message}
+    payload.update(extra)
+    return json.dumps(payload)
+
+
+def _send_command(device_id: str, action: str) -> tuple[bool, str | None]:
+    """Send a Z-Wave command to the device via the home automation API (GET request).
+    Returns (success, error_detail)."""
     base_url = API_URL.rstrip('/')
     url = f"{base_url}/api/devices/{device_id}/command/{action}"
     headers = {}
@@ -64,13 +73,22 @@ def _send_command(device_id: str, action: str) -> bool:
         logger.info(f"Sending command: GET {url}")
         res = requests.get(url, headers=headers, timeout=10)
         res.raise_for_status()
-        return True
+        return True, None
+    except requests.exceptions.Timeout as e:
+        logger.error(f"Timeout calling {url}: {e}")
+        return False, "timeout"
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"Connection error calling {url}: {e}")
+        return False, "connection_error"
     except requests.exceptions.HTTPError as e:
-        logger.error(f"HTTP Error calling {url}: {e.response.status_code} - {e.response.text}")
-        return False
+        code = e.response.status_code if e.response else 0
+        logger.error(f"HTTP Error calling {url}: {code} - {e.response.text if e.response else ''}")
+        if code in (401, 403):
+            return False, "permission_error"
+        return False, "connection_error"
     except Exception as e:
         logger.error(f"Error calling {url}: {e}")
-        return False
+        return False, "unknown_error"
 
 # ----- FastMCP Server -----
 mcp = FastMCP("domotics")
@@ -113,18 +131,22 @@ def set_blinds_state(room: RoomType, action: ActionType) -> str:
     logger.info(f"Command received: set_blinds_state room='{room}' action='{action}'")
     
     if action not in VALID_ACTIONS:
-        return f"Error: action must be one of {VALID_ACTIONS}. Got: '{action}'"
+        return _error_response("validation_error",
+                               f"action must be one of {VALID_ACTIONS}. Got: '{action}'",
+                               available_values=VALID_ACTIONS)
         
     device_id = _resolve_device_id(room)
     if not device_id:
-        available = ", ".join(DEVICE_MAPPING.keys())
-        return f"Error: unknown device '{room}'. Available: {available}"
+        return _error_response("validation_error",
+                               f"Unknown device '{room}'",
+                               available_values=list(DEVICE_MAPPING.keys()))
         
-    success = _send_command(device_id, action)
+    success, err_detail = _send_command(device_id, action)
     if success:
         return f"OK: Persiana '{room}' ({device_id}) → acción '{action}' ejecutada correctamente."
     else:
-        return f"Error: No se pudo enviar '{action}' a '{room}' ({device_id}). Revisa los logs del servidor."
+        return _error_response(err_detail or "connection_error",
+                               f"No se pudo enviar '{action}' a '{room}' ({device_id}).")
 
 @mcp.tool()
 def set_all_blinds_state(action: ActionType) -> str:
@@ -141,7 +163,9 @@ def set_all_blinds_state(action: ActionType) -> str:
     logger.info(f"Command received: set_all_blinds_state action='{action}'")
     
     if action not in VALID_ACTIONS:
-        return f"Error: action must be one of {VALID_ACTIONS}. Got: '{action}'"
+        return _error_response("validation_error",
+                               f"action must be one of {VALID_ACTIONS}. Got: '{action}'",
+                               available_values=VALID_ACTIONS)
         
     seen = set()
     errors = []
@@ -151,12 +175,13 @@ def set_all_blinds_state(action: ActionType) -> str:
             continue
         seen.add(device_id)
         
-        success = _send_command(device_id, action)
+        success, _ = _send_command(device_id, action)
         if not success:
             errors.append(name)
             
     if errors:
-        return f"Error: Acción '{action}' falló para {len(errors)} dispositivos: {', '.join(errors)}"
+        return _error_response("connection_error",
+                               f"Acción '{action}' falló para {len(errors)} dispositivos: {', '.join(errors)}")
         
     return f"OK: Acción '{action}' enviada a TODAS las persianas correctamente."
 

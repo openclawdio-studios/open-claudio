@@ -29,6 +29,13 @@ AUTH_HEADERS = {
 }
 AUTH_HEADERS.update(COMMON_HEADERS)
 
+def _error_response(error_type: str, message: str, **extra) -> str:
+    """Return a structured JSON error string for the self-healing layer."""
+    payload = {"status": "error", "error_type": error_type, "message": message}
+    payload.update(extra)
+    return json.dumps(payload)
+
+
 def _auth() -> str:
     """Perform authentication to the Fermax API and return the Bearer token."""
     if not USERNAME or not PASSWORD:
@@ -87,8 +94,14 @@ def get_fermax_user_info() -> str:
         res = requests.get(url, headers=_get_json_headers(token), timeout=10)
         res.raise_for_status()
         return json.dumps(res.json(), indent=2)
+    except ValueError as e:
+        return _error_response("permission_error", str(e))
+    except requests.exceptions.Timeout as e:
+        return _error_response("timeout", f"Fermax API did not respond: {e}")
+    except requests.exceptions.ConnectionError as e:
+        return _error_response("connection_error", f"Cannot reach Fermax API: {e}")
     except Exception as e:
-        return f"Error obtaining Fermax user info: {str(e)}"
+        return _error_response("connection_error", f"Error obtaining Fermax user info: {str(e)}")
 
 @mcp.tool()
 def get_fermax_device_info() -> str:
@@ -100,8 +113,14 @@ def get_fermax_device_info() -> str:
         res = requests.get(url, headers=_get_json_headers(token), timeout=10)
         res.raise_for_status()
         return json.dumps(res.json(), indent=2)
+    except ValueError as e:
+        return _error_response("permission_error", str(e))
+    except requests.exceptions.Timeout as e:
+        return _error_response("timeout", f"Fermax API did not respond: {e}")
+    except requests.exceptions.ConnectionError as e:
+        return _error_response("connection_error", f"Cannot reach Fermax API: {e}")
     except Exception as e:
-        return f"Error obtaining Fermax device info: {str(e)}"
+        return _error_response("connection_error", f"Error obtaining Fermax device info: {str(e)}")
 
 @mcp.tool()
 def get_fermax_history() -> str:
@@ -113,8 +132,14 @@ def get_fermax_history() -> str:
         res = requests.get(url, headers=_get_json_headers(token), timeout=10)
         res.raise_for_status()
         return json.dumps(res.json(), indent=2)
+    except ValueError as e:
+        return _error_response("permission_error", str(e))
+    except requests.exceptions.Timeout as e:
+        return _error_response("timeout", f"Fermax API did not respond: {e}")
+    except requests.exceptions.ConnectionError as e:
+        return _error_response("connection_error", f"Cannot reach Fermax API: {e}")
     except Exception as e:
-        return f"Error obtaining Fermax history: {str(e)}"
+        return _error_response("connection_error", f"Error obtaining Fermax history: {str(e)}")
 
 @mcp.tool()
 def fermax_open_door() -> str:
@@ -124,7 +149,7 @@ def fermax_open_door() -> str:
         tag, device_id, access_ids = _get_pairings(token)
         
         if not access_ids:
-            return "Error: No access doors visible in pairing map."
+            return _error_response("validation_error", "No access doors visible in pairing map.")
             
         url = f'https://pro-duoxme.fermax.io/deviceaction/api/v1/device/{device_id}/directed-opendoor'
         
@@ -137,8 +162,14 @@ def fermax_open_door() -> str:
             results.append(f"Door {access_id} result: {res.text.strip()}")
             
         return "Success: " + " | ".join(results)
+    except ValueError as e:
+        return _error_response("permission_error", str(e))
+    except requests.exceptions.Timeout as e:
+        return _error_response("timeout", f"Fermax API did not respond: {e}")
+    except requests.exceptions.ConnectionError as e:
+        return _error_response("connection_error", f"Cannot reach Fermax API: {e}")
     except Exception as e:
-        return f"Error opening Fermax door: {str(e)}"
+        return _error_response("connection_error", f"Error opening Fermax door: {str(e)}")
 
 if __name__ == "__main__":
     logger.info("Starting Fermax MCP Server")

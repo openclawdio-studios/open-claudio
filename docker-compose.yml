@@ -57,6 +57,8 @@ services:
       - LLM_API_KEY=${LLM_API_KEY:-not-needed}
     env_file:
       - .env
+    volumes:
+      - ./agent/memory.json:/app/memory.json
     # Using tty/stdin_open to keep it interactive. We'll attach to it via `docker attach open-claudio-agent`
     tty: true
     stdin_open: true

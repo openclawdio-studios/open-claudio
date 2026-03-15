@@ -5,6 +5,10 @@ import os
 from openai import AsyncOpenAI
 from tools import LOCAL_TOOLS
 from mcp_client import MultiMCPClient
+from tool_healing import (
+    parse_tool_result, get_strategy, build_repair_prompt, parse_llm_fix,
+    lookup_known_fix, record_fix, record_metric, MAX_HEAL_RETRIES,
+)
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -69,13 +73,13 @@ class ExtendedReActAgent:
             
         return tools
 
-    async def _execute_tool(self, name: str, arguments: dict) -> str:
+    async def _raw_execute_tool(self, name: str, arguments: dict) -> str:
+        """Execute a tool without healing — returns raw result string."""
         # Check local tools first
         if name in LOCAL_TOOLS:
             logger.info(f"Executing Local Tool: {name}")
             try:
                 fn = LOCAL_TOOLS[name]["function"]
-                # Pass arguments directly for simplicity (tools.py design uses kwargs)
                 result = fn(**arguments)
                 return str(result)
             except Exception as e:
@@ -85,28 +89,119 @@ class ExtendedReActAgent:
         mcp_tools = self.mcp_client.get_available_tools()
         if any(t.name == name for t in mcp_tools):
             return await self.mcp_client.call_tool(name, arguments)
-            
-        return f"Tool {name} not found."
+
+        # Tool not found — return structured error with available tools list
+        all_tool_names = list(LOCAL_TOOLS.keys()) + [t.name for t in mcp_tools]
+        return json.dumps({
+            "status": "error",
+            "error_type": "tool_not_found",
+            "message": f"Tool '{name}' not found.",
+            "available_tools": all_tool_names
+        })
+
+    async def _execute_tool(self, name: str, arguments: dict) -> str:
+        """Execute a tool with self-healing: retry, LLM param correction, and fix memory."""
+        original_arguments = dict(arguments)
+
+        # Step 1: Apply known fix from memory if available
+        fixed_args = lookup_known_fix(self.memory, name, arguments)
+        if fixed_args is not None:
+            logger.info(f"Applying known fix for '{name}': {arguments} → {fixed_args}")
+            arguments = fixed_args
+
+        # Step 2: Execute and parse
+        raw = await self._raw_execute_tool(name, arguments)
+        result = parse_tool_result(raw)
+        record_metric(self.memory, name, result.success, result.error_type)
+
+        if result.success:
+            return result.content
+
+        # Step 3: Determine strategy
+        strategy = get_strategy(result.error_type)
+        logger.warning(f"Tool '{name}' failed (type={result.error_type}, strategy={strategy}): {result.content}")
+
+        # --- Strategy: retry (for connection/timeout errors) ---
+        if strategy in ("retry", "retry_then_report"):
+            for attempt in range(1, MAX_HEAL_RETRIES + 1):
+                logger.info(f"Retry {attempt}/{MAX_HEAL_RETRIES} for '{name}'")
+                await asyncio.sleep(1.5 * attempt)  # backoff
+                raw = await self._raw_execute_tool(name, arguments)
+                result = parse_tool_result(raw)
+                record_metric(self.memory, name, result.success, result.error_type)
+                if result.success:
+                    return result.content
+            # Exhausted retries
+            return f"Tool '{name}' failed after {MAX_HEAL_RETRIES} retries: {result.content}"
+
+        # --- Strategy: llm_fix (for validation errors) ---
+        if strategy == "llm_fix":
+            repair_prompt = build_repair_prompt(name, arguments, result)
+            logger.info(f"Requesting LLM to fix params for '{name}'")
+            try:
+                fix_response = await client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[{"role": "user", "content": repair_prompt}],
+                    temperature=0.0,
+                )
+                fix_text = fix_response.choices[0].message.content or ""
+                new_args = parse_llm_fix(fix_text)
+
+                if new_args and new_args != arguments:
+                    logger.info(f"LLM suggested fix: {arguments} → {new_args}")
+                    raw = await self._raw_execute_tool(name, new_args)
+                    result = parse_tool_result(raw)
+                    record_metric(self.memory, name, result.success, result.error_type)
+                    if result.success:
+                        # Record the fix for future use and persist immediately
+                        record_fix(self.memory, name, original_arguments, new_args)
+                        save_memory(self.memory)
+                        return result.content
+                    else:
+                        return f"Tool '{name}' still failed after LLM correction: {result.content}"
+                else:
+                    logger.warning("LLM could not suggest a valid fix.")
+            except Exception as e:
+                logger.error(f"LLM fix call failed: {e}")
+
+        # --- Strategy: report (permission errors, tool_not_found, unrecoverable) ---
+        # Include available tools hint for tool_not_found so the LLM can self-correct
+        if result.error_type == "tool_not_found" and result.raw and isinstance(result.raw, dict):
+            avail = result.raw.get("available_tools", [])
+            if avail:
+                return (f"Tool '{name}' does not exist. "
+                        f"Available tools: {', '.join(avail)}. "
+                        f"Please use one of the available tools instead.")
+        return f"Tool '{name}' error ({result.error_type}): {result.content}"
 
     async def process_user_input(self, user_input: str) -> str:
+        # Build dynamic tool list for the system prompt (no hardcoded names)
+        tools = self._build_openai_tools()
+        tool_names = [t['function']['name'] for t in tools]
+        tool_list_str = ", ".join(f"`{n}`" for n in tool_names)
+
+        # Only send user-facing memory to the LLM (not internal healing data)
+        llm_memory = {k: v for k, v in self.memory.items()
+                      if k not in ("tool_fixes", "tool_metrics")}
+
         system_prompt = f"""You are 'Open-Claudio', an advanced AI home automation assistant.
 You have access to a set of internal and external tools via function calling.
 CRITICAL INSTRUCTIONS:
 1. You MUST use the provided tools to fulfill the user's request.
-2. DO NOT make up or hallucinate states. If the user asks you to open a blind or a door, YOU MUST CALL THE CORRESPONDING FUNCTION.
-3. If the user asks about Fermax devices, call `get_fermax_device_info` or `fermax_open_door`.
-4. If the user asks about Domotics or blinds (persianas), call `open_blinds` or `set_blinds_state`.
-5. Only reply directly without tool calls if you are just carrying out normal conversation.
+2. DO NOT make up or hallucinate tool names. ONLY use tools from the available list.
+3. Available tools: {tool_list_str}
+4. If the user asks about blinds/persianas, use the relevant blind control tool from the available list.
+5. If the user asks about opening the door/intercom, use the relevant door tool from the available list.
+6. Only reply directly without tool calls if you are just carrying out normal conversation.
 
-User Memory Context: {json.dumps(self.memory)}
+User Memory Context: {json.dumps(llm_memory)}
 """
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input}
         ]
         
-        tools = self._build_openai_tools()
-        logger.debug(f"Sending {len(tools)} tools to LLM: {[t['function']['name'] for t in tools]}")
+        logger.info(f"Sending {len(tools)} tools to LLM: {tool_names}")
         
         for step in range(MAX_STEPS):
             logger.info(f"--- Step {step+1}/{MAX_STEPS} ---")
