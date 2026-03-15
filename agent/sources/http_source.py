@@ -14,6 +14,13 @@ logger = logging.getLogger("HTTPSource")
 HTTP_PORT = int(os.getenv("HTTP_EVENT_PORT", "8080"))
 HTTP_SECRET = os.getenv("HTTP_EVENT_SECRET", "")
 
+if not HTTP_SECRET:
+    raise RuntimeError(
+        "HTTP_EVENT_SECRET is not set. "
+        "The webhook endpoint must be protected by a secret token. "
+        "Set HTTP_EVENT_SECRET in your .env file before enabling HTTP_EVENT_ENABLED=true."
+    )
+
 app = FastAPI(
     title="Open-Claudio Event API",
     description="Webhook endpoint — POST events to be processed by the agent.",
@@ -33,9 +40,8 @@ async def receive_event(
     body: EventRequest,
     authorization: Optional[str] = Header(None),
 ):
-    if HTTP_SECRET:
-        if authorization != f"Bearer {HTTP_SECRET}":
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if authorization != f"Bearer {HTTP_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     event = Event(
         source="http",
