@@ -71,6 +71,7 @@ services:
     container_name: open-claudio-rag
     ports:
       - "8002:8002"
+      - "8003:8003"
     environment:
       - PYTHONUNBUFFERED=1
       - RAG_PORT=8002
@@ -110,6 +111,7 @@ services:
       - DATABASE_URL=postgresql+asyncpg://claudio:${POSTGRES_PASSWORD:-claudio_dev}@postgres:5432/claudio
       - AGENT_QUERY_URL=http://agent:8080/query
       - HTTP_EVENT_SECRET=${HTTP_EVENT_SECRET}
+      - RAG_REST_URL=http://mcp_rag:8003
     depends_on:
       - postgres
       - agent

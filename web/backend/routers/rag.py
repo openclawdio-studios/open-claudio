@@ -1,10 +1,68 @@
-from fastapi import APIRouter, Query
+import os
+import httpx
+from fastapi import APIRouter, Query, UploadFile, File, Form, HTTPException
 from sqlalchemy import select, desc
 from db.connection import AsyncSessionFactory
 from db.models import RagDocument, RagRetrieval
 
 router = APIRouter(prefix="/api/rag", tags=["rag"])
 
+RAG_REST_URL = os.getenv("RAG_REST_URL", "http://mcp_rag:8003")
+
+
+# ── Live data from ChromaDB (via mcp_rag REST) ──────────────────────────────
+
+@router.get("/sources")
+async def list_sources_live():
+    """Live list from ChromaDB (not the observability DB)."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            r = await client.get(f"{RAG_REST_URL}/sources")
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            raise HTTPException(502, f"RAG service unavailable: {exc}")
+
+
+@router.post("/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    doc_type: str = Form("other"),
+    tags: str = Form(""),
+    source: str = Form(""),
+):
+    """Upload a file and ingest it into the knowledge base."""
+    content = await file.read()
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        try:
+            r = await client.post(
+                f"{RAG_REST_URL}/ingest",
+                files={"file": (file.filename, content, file.content_type or "application/octet-stream")},
+                data={"doc_type": doc_type, "tags": tags, "source": source},
+            )
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(e.response.status_code, e.response.text)
+        except Exception as exc:
+            raise HTTPException(502, f"RAG service error: {exc}")
+
+
+@router.delete("/sources/{source_name:path}")
+async def delete_source(source_name: str):
+    """Delete all chunks for a source from the knowledge base."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            r = await client.delete(f"{RAG_REST_URL}/sources/{source_name}")
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(e.response.status_code, e.response.text)
+        except Exception as exc:
+            raise HTTPException(502, f"RAG service error: {exc}")
+
+
+# ── Observability data from PostgreSQL ──────────────────────────────────────
 
 @router.get("/documents")
 async def list_documents(include_deleted: bool = False):

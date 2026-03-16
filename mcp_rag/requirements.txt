@@ -1,6 +1,8 @@
 mcp[cli]
 fastmcp
+fastapi
 uvicorn
+python-multipart
 chromadb>=0.5
 sentence-transformers>=3.0
 rank-bm25

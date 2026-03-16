@@ -21,5 +21,6 @@ COPY . .
 VOLUME ["/data"]
 
 EXPOSE 8002
+EXPOSE 8003
 
-CMD ["python", "-u", "server.py"]
+CMD ["sh", "-c", "python -u rest_api.py & python -u server.py"]
