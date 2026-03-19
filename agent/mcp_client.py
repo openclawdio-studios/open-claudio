@@ -89,6 +89,20 @@ class MultiMCPClient:
             all_tools.extend(conn.get("tools", []))
         return all_tools
 
+    def get_tool_version(self, tool_name: str) -> str:
+        """
+        Return the version for an MCP tool.
+        The MCP protocol does not yet standardise tool versioning, so this
+        returns "1.0" as a default. When servers start providing version
+        metadata this method will be the single place to read it.
+        """
+        for conn in self.connections.values():
+            for t in conn.get("tools", []):
+                if t.name == tool_name:
+                    # Future: return t.metadata.get("version", "1.0") if available
+                    return "1.0"
+        return "1.0"  # local or unknown tools also default to 1.0
+
     async def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
         """Finds which server owns the tool and calls it, with retry for transient errors."""
         MAX_CALL_RETRIES = 2

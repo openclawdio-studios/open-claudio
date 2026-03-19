@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
 import uvicorn
@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from db import recorder
 from event_queue import Event, get_queue
 
 logger = logging.getLogger("HTTPSource")
@@ -68,9 +69,29 @@ class QueryRequest(BaseModel):
 async def query_agent(
     body: QueryRequest,
     authorization: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None),
 ):
     if authorization != f"Bearer {HTTP_SECRET}":
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # ── Quota check ───────────────────────────────────────────────────────────
+    if x_user_id:
+        allowed, used, limit = await recorder.check_user_quota(x_user_id)
+        if not allowed:
+            tomorrow = (
+                datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+                + timedelta(days=1)
+            )
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "status": "quota_exceeded",
+                    "error": f"Daily token quota exceeded ({used:,} / {limit:,} tokens used).",
+                    "tokens_used": used,
+                    "tokens_limit": limit,
+                    "reset_at": tomorrow.isoformat(),
+                },
+            )
 
     loop = asyncio.get_running_loop()
     future: asyncio.Future = loop.create_future()
@@ -85,7 +106,7 @@ async def query_agent(
         topic="http/webhook",
         payload={"text": body.message},
         timestamp=datetime.now(),
-        metadata={"source": body.source},
+        metadata={"source": body.source, "user_id": x_user_id},
         reply_fn=reply_fn,
     )
 

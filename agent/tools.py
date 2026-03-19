@@ -37,6 +37,7 @@ LOCAL_TOOLS = {
     "get_time": {
         "description": "get current system time",
         "function": get_time,
+        "capabilities": ["utility", "time"],
         "schema": {
             "type": "object",
             "properties": {},
@@ -46,6 +47,7 @@ LOCAL_TOOLS = {
     "read_file": {
         "description": "read a file from disk. input: {\"path\":\"file\"}",
         "function": read_file,
+        "capabilities": ["server", "file_system"],
         "schema": {
             "type": "object",
             "properties": {
@@ -57,6 +59,7 @@ LOCAL_TOOLS = {
     "list_files": {
         "description": "list files in directory. input: {\"path\":\"dir\"}",
         "function": list_files,
+        "capabilities": ["server", "file_system"],
         "schema": {
             "type": "object",
             "properties": {
@@ -68,6 +71,7 @@ LOCAL_TOOLS = {
     "http_get": {
         "description": "fetch a web url. input: {\"url\":\"http://...\"}",
         "function": http_get,
+        "capabilities": ["server", "http", "utility"],
         "schema": {
             "type": "object",
             "properties": {
@@ -76,4 +80,30 @@ LOCAL_TOOLS = {
             "required": ["url"]
         }
     }
+}
+
+# Capability tags for ALL tools in the system (local + known MCP tools).
+# Used by the planner for capability-based routing and by the executor for
+# tool metadata enrichment. MCP tool capabilities are defined here since the
+# MCP protocol does not carry capability metadata.
+TOOL_CAPABILITIES: Dict[str, list] = {
+    # Local tools
+    "get_time":          ["utility", "time"],
+    "read_file":         ["server", "file_system"],
+    "list_files":        ["server", "file_system"],
+    "http_get":          ["server", "http", "utility"],
+    # MCP — domotics
+    "set_blinds_state":      ["home_automation", "blinds"],
+    "set_all_blinds_state":  ["home_automation", "blinds"],
+    "fermax_open_door":      ["home_automation", "door_control"],
+    # MCP — intercom
+    "get_fermax_user_info":   ["intercom", "account"],
+    "get_fermax_device_info": ["intercom", "device"],
+    "get_fermax_history":     ["intercom", "history"],
+    # MCP — knowledge / RAG
+    "rag_search":        ["knowledge", "search"],
+    "rag_ingest":        ["knowledge", "ingestion"],
+    "rag_ingest_file":   ["knowledge", "ingestion"],
+    "rag_delete_source": ["knowledge", "management"],
+    "rag_list_sources":  ["knowledge", "management"],
 }

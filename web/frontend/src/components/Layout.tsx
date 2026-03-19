@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom'
-import { MessageSquare, Activity, BarChart2, BookOpen, Zap, Wrench } from 'lucide-react'
+import { MessageSquare, Activity, BarChart2, BookOpen, Zap, Wrench, Users } from 'lucide-react'
 import { clsx } from 'clsx'
 
 const NAV = [
@@ -9,6 +9,7 @@ const NAV = [
   { to: '/knowledge', icon: BookOpen, label: 'Knowledge' },
   { to: '/events', icon: Zap, label: 'Events' },
   { to: '/tools', icon: Wrench, label: 'Tools' },
+  { to: '/users', icon: Users, label: 'Users' },
 ]
 
 export default function Layout({ children }: { children: React.ReactNode }) {

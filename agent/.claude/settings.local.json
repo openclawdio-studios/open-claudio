@@ -19,7 +19,12 @@
       "Bash(sleep:*)",
       "Bash(curl:*)",
       "Bash(docker rm:*)",
-      "Bash(docker stop:*)"
+      "Bash(docker stop:*)",
+      "Bash(cat:*)",
+      "Bash(pip install:*)",
+      "Bash(where:*)",
+      "Bash(py:*)",
+      "Bash(docker cp:*)"
     ]
   }
 }

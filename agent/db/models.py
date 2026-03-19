@@ -47,6 +47,7 @@ class Trace(Base):
     duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     completed_at: Mapped[Optional[datetime]] = mapped_column()
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
 
 
 class Span(Base):
@@ -183,4 +184,19 @@ class Feedback(Base):
     rating: Mapped[str] = mapped_column(String(20), nullable=False)
     comment: Mapped[Optional[str]] = mapped_column(Text)
     corrected_output: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+
+
+class Correction(Base):
+    __tablename__ = "corrections"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    trace_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("traces.id", ondelete="SET NULL"), nullable=True
+    )
+    agent_name: Mapped[Optional[str]] = mapped_column(String(100))
+    tool_name: Mapped[Optional[str]] = mapped_column(String(100))
+    wrong_value: Mapped[Optional[str]] = mapped_column(Text)
+    correct_value: Mapped[Optional[str]] = mapped_column(Text)
+    raw_message: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)

@@ -200,6 +200,43 @@ CREATE TABLE feedback (
 );
 
 -- =============================================================================
+-- BLOQUE 9: USUARIOS, API KEYS Y QUOTAS
+-- =============================================================================
+
+CREATE TABLE users (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    username     VARCHAR(50) UNIQUE NOT NULL,
+    display_name TEXT,
+    is_active    BOOLEAN     NOT NULL DEFAULT true,
+    is_admin     BOOLEAN     NOT NULL DEFAULT false,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ
+);
+
+-- Raw key never stored — only SHA-256 hash
+CREATE TABLE api_keys (
+    id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id      UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    key_hash     CHAR(64)    NOT NULL UNIQUE,
+    key_prefix   VARCHAR(13) NOT NULL,   -- "clau-XXXXXXXX" for display
+    name         TEXT,
+    is_active    BOOLEAN     NOT NULL DEFAULT true,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ,
+    expires_at   TIMESTAMPTZ
+);
+
+-- Daily token quota per user (-1 = unlimited)
+CREATE TABLE token_quotas (
+    user_id      UUID    PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    daily_tokens INTEGER NOT NULL DEFAULT 100000,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- user_id on traces (added here for fresh installs; migration adds it to existing DBs)
+ALTER TABLE traces ADD COLUMN user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+
+-- =============================================================================
 -- ÍNDICES — optimizados para las queries de observabilidad más frecuentes
 -- =============================================================================
 
@@ -235,6 +272,11 @@ CREATE INDEX idx_rag_ret_created_at   ON rag_retrievals (created_at DESC);
 CREATE INDEX idx_events_source        ON events (source);
 CREATE INDEX idx_events_received_at   ON events (received_at DESC);
 CREATE INDEX idx_events_trace         ON events (trace_id);
+
+-- Users / API keys
+CREATE INDEX idx_traces_user_id ON traces (user_id);
+CREATE INDEX idx_api_keys_hash  ON api_keys (key_hash);
+CREATE INDEX idx_api_keys_user  ON api_keys (user_id);
 
 -- =============================================================================
 -- VISTAS ANALÍTICAS
@@ -318,3 +360,14 @@ FROM rag_documents
 WHERE deleted_at IS NULL
 GROUP BY 1, 2
 ORDER BY total_chunks DESC;
+
+-- Tokens consumed per user per day (for quota enforcement and analytics)
+CREATE VIEW v_user_daily_usage AS
+SELECT
+    t.user_id,
+    t.created_at::date                                                    AS day,
+    COALESCE(SUM(t.tokens_prompt_total + t.tokens_completion_total), 0)   AS tokens_used
+FROM traces t
+WHERE t.user_id IS NOT NULL
+  AND t.status NOT IN ('running')
+GROUP BY t.user_id, t.created_at::date;

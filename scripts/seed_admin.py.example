@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""
+Bootstrap script — creates the initial admin user and API key.
+
+USAGE:
+  1. Copy this file:   cp scripts/seed_admin.py.example scripts/seed_admin.py
+  2. Edit ADMIN_USERNAME and ADMIN_DISPLAY_NAME below.
+  3. Ensure the database is running:  docker-compose up -d postgres
+  4. Run:  python scripts/seed_admin.py
+
+The raw API key is printed ONCE and never stored in plain text.
+Copy it to your dashboard (Settings → API Key) or .env file.
+
+seed_admin.py is git-ignored to prevent accidental credential commits.
+"""
+
+# ── Configuration — edit before running ───────────────────────────────────────
+ADMIN_USERNAME     = "admin"
+ADMIN_DISPLAY_NAME = "Administrator"
+KEY_NAME           = "Default admin key"
+DAILY_TOKEN_LIMIT  = -1          # -1 = unlimited
+
+# Database URL — defaults to local dev. Override with DATABASE_URL env var.
+import os
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://claudio:claudio_dev@localhost:5432/claudio"
+)
+# ──────────────────────────────────────────────────────────────────────────────
+
+import asyncio
+import hashlib
+import secrets
+import sys
+
+
+async def main() -> None:
+    try:
+        import asyncpg
+    except ImportError:
+        print("ERROR: asyncpg not installed. Run:  pip install asyncpg")
+        sys.exit(1)
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        raw_key = "clau-" + secrets.token_urlsafe(32)
+        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+        key_prefix = raw_key[:13]
+
+        async with conn.transaction():
+            user_id = await conn.fetchval(
+                """
+                INSERT INTO users (username, display_name, is_active, is_admin)
+                VALUES ($1, $2, true, true)
+                ON CONFLICT (username) DO UPDATE
+                    SET display_name = EXCLUDED.display_name,
+                        is_admin     = true,
+                        is_active    = true
+                RETURNING id
+                """,
+                ADMIN_USERNAME,
+                ADMIN_DISPLAY_NAME,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO token_quotas (user_id, daily_tokens)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE SET daily_tokens = EXCLUDED.daily_tokens
+                """,
+                user_id,
+                DAILY_TOKEN_LIMIT,
+            )
+
+            key_id = await conn.fetchval(
+                """
+                INSERT INTO api_keys (user_id, key_hash, key_prefix, name)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id
+                """,
+                user_id,
+                key_hash,
+                key_prefix,
+                KEY_NAME,
+            )
+
+        print()
+        print("✅  Admin user created successfully!")
+        print(f"    Username:  {ADMIN_USERNAME}")
+        print(f"    User ID:   {user_id}")
+        print(f"    Key ID:    {key_id}")
+        print()
+        print("🔑  API Key (shown once — store it safely):")
+        print()
+        print(f"    {raw_key}")
+        print()
+        print("    Paste this key into the dashboard → enter API key prompt.")
+        print()
+    finally:
+        await conn.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

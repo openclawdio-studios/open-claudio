@@ -2,11 +2,16 @@
 Knowledge Agent — queries and manages the RAG knowledge base.
 """
 
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
 from agents.base_agent import BaseAgent
-from mcp_client import MultiMCPClient
-from openai import AsyncOpenAI
+
+if TYPE_CHECKING:
+    from context import AgentContext
 
 KNOWLEDGE_TOOLS = ["rag_search", "rag_ingest", "rag_ingest_file", "rag_delete_source", "rag_list_sources"]
+KNOWLEDGE_CAPABILITIES = ["knowledge", "search", "ingestion", "management"]
 
 KNOWLEDGE_PROMPT = """You are the Knowledge Agent for Open-Claudio.
 You manage and query the knowledge base: device manuals, configs, how-to guides, user preferences, and logs.
@@ -20,13 +25,6 @@ RULES:
 6. Use rag_list_sources to show what is currently indexed."""
 
 
-def make_knowledge_agent(
-    mcp_client: MultiMCPClient,
-    memory: dict,
-    llm_client: AsyncOpenAI,
-    model: str,
-) -> BaseAgent:
+def make_knowledge_agent(ctx: AgentContext) -> BaseAgent:
     """Factory that creates a pre-configured Knowledge Agent."""
-    return BaseAgent(
-        "knowledge", KNOWLEDGE_TOOLS, mcp_client, memory, llm_client, model, KNOWLEDGE_PROMPT
-    )
+    return BaseAgent("knowledge", KNOWLEDGE_TOOLS, ctx, KNOWLEDGE_PROMPT, KNOWLEDGE_CAPABILITIES)

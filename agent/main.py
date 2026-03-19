@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import sys
@@ -7,6 +6,9 @@ import time
 from openai import AsyncOpenAI
 from db import recorder
 from mcp_client import MultiMCPClient
+from context import AgentContext
+from executor import Executor
+from tools_registry import DynamicToolRegistry
 from agents.home_agent import make_home_agent
 from agents.server_agent import make_server_agent
 from agents.intercom_agent import make_intercom_agent
@@ -26,57 +28,59 @@ MCP_SERVER_URLS = os.getenv("MCP_SERVER_URLS", "http://mcp_domotics:8000/sse").s
 llm_client = AsyncOpenAI(base_url=LLM_ENDPOINT, api_key=LLM_API_KEY)
 
 
-def load_memory():
-    try:
-        with open("memory.json") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_memory(memory):
-    with open("memory.json", "w") as f:
-        json.dump(memory, f, indent=2)
-
-
 class OpenClaudio:
     """
     Top-level orchestrator for the Open-Claudio hierarchical + event-driven agent system.
 
     Lifecycle:
         oc = OpenClaudio()
-        await oc.initialize()      # connect MCP, build agents
+        await oc.initialize()      # connect MCP, build context + agents
         result = await oc.process(user_input)
-        await oc.shutdown()        # disconnect, save memory
+        await oc.shutdown()        # disconnect, save context scratchpad
     """
 
     def __init__(self):
         self.mcp_client = MultiMCPClient(server_urls=MCP_SERVER_URLS)
-        self.memory = load_memory()
+        self.ctx: AgentContext = None
         self.planner: PlannerAgent = None
         self.agents: dict = {}
 
     async def initialize(self):
-        """Connect to all MCP servers, instantiate agents, and init DB recorder."""
+        """Connect to all MCP servers, build AgentContext, instantiate agents."""
         logger.info("Connecting to MCP servers...")
         await self.mcp_client.connect()
         await recorder.init()
 
-        logger.info("Instantiating domain agents...")
-        shared = dict(
+        logger.info("Building AgentContext...")
+        scratchpad = AgentContext.load_scratchpad()
+
+        # Build context first (executor=None), then create Executor with the context
+        # reference, then wire it back. AgentContext is a mutable dataclass so
+        # assigning ctx.executor after construction is safe.
+        self.ctx = AgentContext(
             mcp_client=self.mcp_client,
-            memory=self.memory,
             llm_client=llm_client,
             model=MODEL_NAME,
+            executor=None,  # type: ignore[arg-type]  — set below
+            memory=scratchpad["memory"],
+            history=scratchpad["history"],
         )
+        self.ctx.executor = Executor(self.ctx)
+
+        logger.info("Loading dynamic tool registry...")
+        registry = DynamicToolRegistry()
+        registry.load_from_disk()
+        self.ctx.registry = registry
+
+        logger.info("Instantiating domain agents...")
         self.agents = {
-            "home":      make_home_agent(**shared),
-            "server":    make_server_agent(**shared),
-            "intercom":  make_intercom_agent(**shared),
-            "utility":   make_utility_agent(**shared),
-            "knowledge": make_knowledge_agent(**shared),
+            "home":      make_home_agent(self.ctx),
+            "server":    make_server_agent(self.ctx),
+            "intercom":  make_intercom_agent(self.ctx),
+            "utility":   make_utility_agent(self.ctx),
+            "knowledge": make_knowledge_agent(self.ctx),
         }
-        self.planner = PlannerAgent(agents=self.agents, llm_client=llm_client, model=MODEL_NAME)
+        self.planner = PlannerAgent(agents=self.agents, ctx=self.ctx)
         logger.info("OpenClaudio initialized. Agents: %s", list(self.agents.keys()))
 
     async def process(self, user_input: str, source: str = "cli") -> str:
@@ -104,10 +108,11 @@ class OpenClaudio:
             )
 
     async def shutdown(self):
-        """Disconnect from MCP servers and persist memory."""
+        """Disconnect from MCP servers and persist context scratchpad."""
         await self.mcp_client.disconnect()
-        save_memory(self.memory)
-        logger.info("OpenClaudio shut down. Memory saved.")
+        if self.ctx:
+            self.ctx.save()
+        logger.info("OpenClaudio shut down. Context saved.")
 
 
 def _build_event_tasks(oc: OpenClaudio) -> list:

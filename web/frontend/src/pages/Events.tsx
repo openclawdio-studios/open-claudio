@@ -11,6 +11,7 @@ interface EventRow {
   payload: Record<string, unknown> | null
   received_at: string
   processed_at: string | null
+  user: string | null
 }
 
 export default function Events() {
@@ -35,6 +36,7 @@ export default function Events() {
             <thead>
               <tr className="border-b border-gray-800 text-gray-500 text-xs uppercase sticky top-0 bg-gray-950">
                 <th className="px-6 py-3 text-left">Time</th>
+                <th className="px-4 py-3 text-left">User</th>
                 <th className="px-4 py-3 text-left">Source</th>
                 <th className="px-4 py-3 text-left">Type</th>
                 <th className="px-4 py-3 text-left">Topic</th>
@@ -47,6 +49,9 @@ export default function Events() {
                 <tr key={e.id} className="hover:bg-gray-900/50 transition-colors">
                   <td className="px-6 py-2.5 text-xs text-gray-500 whitespace-nowrap">
                     {new Date(e.received_at).toLocaleTimeString()}
+                  </td>
+                  <td className="px-4 py-2.5 text-xs text-gray-400 font-mono">
+                    {e.user ?? <span className="text-gray-700">—</span>}
                   </td>
                   <td className="px-4 py-2.5"><Badge variant="blue">{e.source}</Badge></td>
                   <td className="px-4 py-2.5 text-gray-400">{e.event_type}</td>

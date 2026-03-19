@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
-import { Send, Loader2 } from 'lucide-react'
-import { api } from '../api'
+import { Send, Loader2, Key } from 'lucide-react'
+import { api, getApiKey, setApiKey } from '../api'
 
 interface Message {
   role: 'user' | 'assistant'
@@ -12,6 +12,8 @@ export default function Playground() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [showKeyInput, setShowKeyInput] = useState(false)
+  const [keyDraft, setKeyDraft] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -39,16 +41,55 @@ export default function Playground() {
     }
   }
 
+  const apiKey = getApiKey()
+
   return (
     <div className="flex flex-col h-full">
-      <div className="h-14 px-6 flex items-center border-b border-gray-800">
+      <div className="h-14 px-6 flex items-center border-b border-gray-800 gap-4">
         <h1 className="font-semibold text-gray-100">Playground</h1>
-        <span className="ml-3 text-xs text-gray-500">Chat with the agent in real-time</span>
+        <span className="flex-1 text-xs text-gray-500">Chat with the agent in real-time</span>
+        {showKeyInput ? (
+          <div className="flex items-center gap-2">
+            <input
+              type="password"
+              value={keyDraft}
+              onChange={e => setKeyDraft(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && keyDraft) { setApiKey(keyDraft); setKeyDraft(''); setShowKeyInput(false) }
+                if (e.key === 'Escape') setShowKeyInput(false)
+              }}
+              className="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-xs text-gray-200 w-64 focus:outline-none focus:border-brand-500"
+              placeholder="clau-..."
+              autoFocus
+            />
+            <button
+              disabled={!keyDraft}
+              onClick={() => { setApiKey(keyDraft); setKeyDraft(''); setShowKeyInput(false) }}
+              className="px-3 py-1.5 bg-brand-600 hover:bg-brand-700 disabled:bg-gray-800 text-white text-xs rounded-lg"
+            >Save</button>
+            <button onClick={() => setShowKeyInput(false)} className="text-xs text-gray-500 hover:text-gray-300">Cancel</button>
+          </div>
+        ) : (
+          <button
+            onClick={() => setShowKeyInput(true)}
+            className="flex items-center gap-1.5 text-xs text-gray-500 hover:text-gray-300"
+            title={apiKey ? 'Change API key' : 'Set API key'}
+          >
+            <Key size={13} />
+            {apiKey ? apiKey.slice(0, 13) + '…' : 'Set API key'}
+          </button>
+        )}
       </div>
 
       {/* Messages */}
       <div className="flex-1 overflow-auto px-6 py-4 space-y-4">
-        {messages.length === 0 && (
+        {!apiKey && (
+          <div className="bg-yellow-900/20 border border-yellow-800/40 rounded-xl px-4 py-3 flex items-center gap-3 text-sm">
+            <Key size={15} className="text-yellow-400 flex-shrink-0" />
+            <span className="text-yellow-300">Set your API key (top-right) to start chatting.</span>
+          </div>
+        )}
+        {messages.length === 0 && apiKey && (
           <div className="text-center text-gray-600 mt-20">
             <p className="text-lg">Ask the agent anything</p>
             <p className="text-sm mt-1">Commands, queries, home automation...</p>

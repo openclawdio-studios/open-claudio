@@ -48,6 +48,45 @@ _CLASSIFICATION_KEYWORDS: List[Tuple[str, list]] = [
 
 MAX_HEAL_RETRIES = 2
 
+# ---------------------------------------------------------------------------
+# Tool avoidance (based on runtime metrics)
+# ---------------------------------------------------------------------------
+
+TOOL_AVOIDANCE_MIN_CALLS = 5    # minimum calls before success_rate is trusted
+TOOL_AVOIDANCE_THRESHOLD = 0.8  # below this success_rate the tool is avoided
+
+
+def should_avoid_tool(mem_ns: dict, tool_name: str) -> tuple:
+    """
+    Decide whether a tool should be skipped based on its runtime track record.
+
+    Returns
+    -------
+    (avoid: bool, reason: str)
+        avoid  — True if the tool should be skipped this call.
+        reason — human-readable explanation (empty string when avoid=False).
+
+    A tool is avoided only when:
+      - it has at least TOOL_AVOIDANCE_MIN_CALLS recorded calls (enough data), AND
+      - its success_rate is below TOOL_AVOIDANCE_THRESHOLD.
+    """
+    stats = mem_ns.get("tool_metrics", {}).get(tool_name, {})
+    calls = stats.get("calls", 0)
+
+    if calls < TOOL_AVOIDANCE_MIN_CALLS:
+        return False, ""  # insufficient data — do not penalise
+
+    errors = stats.get("errors", 0)
+    success_rate = (calls - errors) / calls
+
+    if success_rate < TOOL_AVOIDANCE_THRESHOLD:
+        return True, (
+            f"success_rate={success_rate:.0%} over {calls} calls "
+            f"(threshold: {TOOL_AVOIDANCE_THRESHOLD:.0%}, "
+            f"min_calls: {TOOL_AVOIDANCE_MIN_CALLS})"
+        )
+    return False, ""
+
 
 # ---------------------------------------------------------------------------
 # Structured result helpers

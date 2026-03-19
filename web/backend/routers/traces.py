@@ -1,9 +1,10 @@
 from typing import Optional
 from uuid import UUID
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import select, desc
 from db.connection import AsyncSessionFactory
-from db.models import Trace, Span, LLMCall, ToolCall
+from db.models import Trace, Span, LLMCall, ToolCall, User
+from auth import get_optional_user
 
 router = APIRouter(prefix="/api/traces", tags=["traces"])
 
@@ -14,31 +15,53 @@ async def list_traces(
     offset: int = 0,
     source: Optional[str] = None,
     status: Optional[str] = None,
+    viewer: Optional[User] = Depends(get_optional_user),
 ):
     async with AsyncSessionFactory() as session:
-        q = select(Trace).order_by(desc(Trace.created_at)).limit(limit).offset(offset)
+        q = (
+            select(Trace, User)
+            .outerjoin(User, Trace.user_id == User.id)
+            .order_by(desc(Trace.created_at))
+            .limit(limit)
+            .offset(offset)
+        )
         if source:
             q = q.where(Trace.source == source)
         if status:
             q = q.where(Trace.status == status)
+        # Non-admin authenticated users see only their own traces
+        if viewer and not viewer.is_admin:
+            q = q.where(Trace.user_id == viewer.id)
+
         result = await session.execute(q)
-        traces = result.scalars().all()
-        return [_trace_dict(t) for t in traces]
+        return [_trace_dict(t, u) for t, u in result.all()]
 
 
 @router.get("/{trace_id}")
-async def get_trace(trace_id: UUID):
+async def get_trace(
+    trace_id: UUID,
+    viewer: Optional[User] = Depends(get_optional_user),
+):
     async with AsyncSessionFactory() as session:
-        trace = await session.get(Trace, trace_id)
-        if not trace:
+        result = await session.execute(
+            select(Trace, User)
+            .outerjoin(User, Trace.user_id == User.id)
+            .where(Trace.id == trace_id)
+        )
+        row = result.one_or_none()
+        if not row:
             raise HTTPException(404, "Trace not found")
+        trace, owner = row
+
+        # Non-admin can only access their own traces
+        if viewer and not viewer.is_admin and trace.user_id != viewer.id:
+            raise HTTPException(403, "Access denied")
 
         spans_result = await session.execute(
             select(Span).where(Span.trace_id == trace_id).order_by(Span.started_at)
         )
         spans = spans_result.scalars().all()
 
-        # LLM calls via span_id join
         span_ids = [s.id for s in spans]
         llm_calls = []
         tool_calls = []
@@ -53,15 +76,14 @@ async def get_trace(trace_id: UUID):
             tool_calls = tool_result.scalars().all()
 
         return {
-            **_trace_dict(trace),
+            **_trace_dict(trace, owner),
             "spans": [_span_dict(s) for s in spans],
             "llm_calls": [_llm_dict(c) for c in llm_calls],
             "tool_calls": [_tool_dict(c) for c in tool_calls],
         }
 
 
-def _trace_dict(t: Trace) -> dict:
-    total_tokens = t.tokens_prompt_total + t.tokens_completion_total
+def _trace_dict(t: Trace, owner: Optional[User] = None) -> dict:
     return {
         "id": str(t.id),
         "source": t.source,
@@ -70,9 +92,10 @@ def _trace_dict(t: Trace) -> dict:
         "ended_at": t.completed_at.isoformat() if t.completed_at else None,
         "input_text": t.user_input,
         "output_text": t.final_output,
-        "total_tokens": total_tokens,
+        "total_tokens": t.tokens_prompt_total + t.tokens_completion_total,
         "duration_ms": t.duration_ms,
         "error": None,
+        "user": owner.username if owner else None,
     }
 
 

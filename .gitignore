@@ -32,3 +32,6 @@ agent/memory.json
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Bootstrap scripts (contain real credentials)
+scripts/seed_admin.py

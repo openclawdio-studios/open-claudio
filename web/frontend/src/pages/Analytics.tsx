@@ -3,6 +3,7 @@ import {
   BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid
 } from 'recharts'
 import { api } from '../api'
+import { ShieldCheck, User } from 'lucide-react'
 
 function StatCard({ label, value }: { label: string; value: string | number }) {
   return (
@@ -18,9 +19,25 @@ export default function Analytics() {
   const { data: dailyTokens = [] } = useQuery({ queryKey: ['daily-tokens'], queryFn: api.analytics.dailyTokens })
   const { data: toolRates = [] } = useQuery({ queryKey: ['tool-rates'], queryFn: api.analytics.toolSuccessRates })
 
+  const viewer = (summary as Record<string, unknown>)._viewer as string | null
+  const isAdmin = (summary as Record<string, unknown>)._is_admin as boolean
+
   return (
     <div className="p-6 space-y-6">
-      <h1 className="font-semibold text-gray-100">Analytics</h1>
+      <div className="flex items-center gap-3">
+        <h1 className="font-semibold text-gray-100">Analytics</h1>
+        {viewer ? (
+          isAdmin ? (
+            <span className="flex items-center gap-1.5 text-xs text-brand-400 bg-brand-900/20 border border-brand-800/40 px-2 py-1 rounded-full">
+              <ShieldCheck size={12} /> All users
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-xs text-gray-400 bg-gray-800 px-2 py-1 rounded-full">
+              <User size={12} /> {viewer}
+            </span>
+          )
+        ) : null}
+      </div>
 
       {/* KPIs */}
       <div className="grid grid-cols-3 lg:grid-cols-6 gap-4">

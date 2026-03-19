@@ -1,34 +1,55 @@
 """
 BaseAgent — the reusable ReAct loop used by every domain agent.
 
-Each agent is constructed with a whitelist of tool names; only those tools
-are exposed to the LLM, and only those tools can be executed.  Self-healing
-(retry, LLM parameter correction, fix memory) is built in, with per-agent
-memory namespacing so fix data stays isolated.
+Each agent is constructed with a whitelist of tool names and an AgentContext.
+The agent is responsible only for reasoning: building prompts, calling the LLM,
+and interpreting responses. All tool execution, healing, and metrics are
+delegated to ctx.executor.
 """
 
-import asyncio
+from __future__ import annotations
+
 import json
 import logging
 import os
+import re
 import time
-from typing import List, Optional
+from typing import TYPE_CHECKING, Optional
 
-from openai import AsyncOpenAI
-
-from tools import LOCAL_TOOLS
-from mcp_client import MultiMCPClient
 from db import recorder
-from tool_healing import (
-    parse_tool_result,
-    get_strategy,
-    build_repair_prompt,
-    parse_llm_fix,
-    lookup_known_fix,
-    record_fix,
-    record_metric,
-    MAX_HEAL_RETRIES,
-)
+
+if TYPE_CHECKING:
+    from context import AgentContext
+
+# ---------------------------------------------------------------------------
+# Correction detection
+# ---------------------------------------------------------------------------
+
+# Each entry: (compiled_pattern, wrong_group_index_or_None, correct_group_index)
+_CORRECTION_PATTERNS = [
+    # "no era el salon, era el dormitorio" → wrong=salon, correct=dormitorio
+    (re.compile(r"no era (?:el |la )?(.+?),?\s+era (?:el |la )?(.+)", re.I), 1, 2),
+    # "me refería a X" → correct=X
+    (re.compile(r"me refer[íi]a a (.+)", re.I), None, 1),
+    # "quería decir X" → correct=X
+    (re.compile(r"quer[íi]a decir (.+)", re.I), None, 1),
+    # "no X, Y" (generic fallback) → wrong=X, correct=Y
+    (re.compile(r"\bno\s+(.+?),\s+(.+)", re.I), 1, 2),
+]
+
+
+def _detect_correction(message: str) -> Optional[dict]:
+    """
+    Return {wrong_value, correct_value} if the message looks like a user
+    correction, or None if no pattern matches.
+    """
+    for pattern, wrong_grp, correct_grp in _CORRECTION_PATTERNS:
+        m = pattern.search(message)
+        if m:
+            wrong = m.group(wrong_grp).strip() if wrong_grp else None
+            correct = m.group(correct_grp).strip()
+            return {"wrong_value": wrong, "correct_value": correct}
+    return None
 
 MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
 
@@ -37,7 +58,7 @@ logger = logging.getLogger("BaseAgent")
 
 class BaseAgent:
     """
-    A single-domain ReAct agent.
+    A single-domain ReAct agent. Owns only reasoning logic.
 
     Parameters
     ----------
@@ -45,15 +66,8 @@ class BaseAgent:
         Unique identifier for this agent (used for logging and memory namespacing).
     tool_names : list[str]
         Whitelist of tool names this agent is allowed to use.
-    mcp_client : MultiMCPClient
-        Shared MCP client for remote tool calls.
-    memory : dict
-        Shared top-level memory dict.  The agent reads/writes only to the
-        sub-dict ``memory[name]``.
-    llm_client : AsyncOpenAI
-        Pre-constructed async OpenAI-compatible client.
-    model : str
-        Model identifier string sent to the LLM API.
+    ctx : AgentContext
+        Shared context providing executor, llm_client, model, and memory.
     system_prompt_extra : str
         Additional instructions appended to the base system prompt.
     """
@@ -61,252 +75,24 @@ class BaseAgent:
     def __init__(
         self,
         name: str,
-        tool_names: List[str],
-        mcp_client: MultiMCPClient,
-        memory: dict,
-        llm_client: AsyncOpenAI,
-        model: str,
+        tool_names: list,
+        ctx: AgentContext,
         system_prompt_extra: str = "",
+        capabilities: list = None,
     ):
         self.name = name
         self.tool_names = set(tool_names)
-        self.mcp_client = mcp_client
-        self.memory = memory
-        self.llm_client = llm_client
-        self.model = model
+        self.ctx = ctx
         self.system_prompt_extra = system_prompt_extra
-
-    # ------------------------------------------------------------------
-    # Memory namespace helper
-    # ------------------------------------------------------------------
-
-    def _mem(self) -> dict:
-        """Return (and lazily create) the per-agent memory sub-dict."""
-        return self.memory.setdefault(self.name, {})
-
-    # ------------------------------------------------------------------
-    # Tool source detection (for observability)
-    # ------------------------------------------------------------------
-
-    def _tool_source(self, name: str) -> str:
-        """Return which server/layer owns the tool (for DB recording)."""
-        if name in LOCAL_TOOLS:
-            return "local"
-        for url, conn in self.mcp_client.connections.items():
-            if any(t.name == name for t in conn.get("tools", [])):
-                try:
-                    return url.split("//")[1].split(":")[0]  # e.g. "mcp_domotics"
-                except Exception:
-                    return "mcp_unknown"
-        return "unknown"
+        self.capabilities: list = capabilities or []
 
     # ------------------------------------------------------------------
     # Tool building
     # ------------------------------------------------------------------
 
     def _build_tools(self) -> list:
-        """
-        Build the OpenAI function-calling tool list, filtered to only the
-        tools in ``self.tool_names``.
-        """
-        tools = []
-
-        # Local tools — include only those in the whitelist
-        for name, tool_info in LOCAL_TOOLS.items():
-            if name not in self.tool_names:
-                continue
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": tool_info["description"],
-                    "parameters": tool_info.get("schema", {"type": "object", "properties": {}}),
-                },
-            })
-
-        # MCP remote tools — include only those in the whitelist
-        mcp_tools = self.mcp_client.get_available_tools()
-        for t in mcp_tools:
-            if t.name not in self.tool_names:
-                continue
-            tools.append({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description or f"MCP tool {t.name}",
-                    "parameters": t.inputSchema,
-                },
-            })
-
-        return tools
-
-    # ------------------------------------------------------------------
-    # Raw execution (no healing)
-    # ------------------------------------------------------------------
-
-    async def _raw_execute_tool(self, name: str, arguments: dict) -> str:
-        """Execute a whitelisted tool without any healing logic."""
-        if name not in self.tool_names:
-            return json.dumps({
-                "status": "error",
-                "error_type": "tool_not_found",
-                "message": (
-                    f"Tool '{name}' is not in the allowed tool list for agent '{self.name}'. "
-                    f"Allowed tools: {sorted(self.tool_names)}"
-                ),
-            })
-
-        # Local tools have priority
-        if name in LOCAL_TOOLS:
-            logger.info(f"[{self.name}] Executing local tool: {name}")
-            try:
-                fn = LOCAL_TOOLS[name]["function"]
-                result = fn(**arguments)
-                return str(result)
-            except Exception as e:
-                return f"Error executing local tool {name}: {str(e)}"
-
-        # MCP remote tools
-        mcp_tools = self.mcp_client.get_available_tools()
-        if any(t.name == name for t in mcp_tools):
-            return await self.mcp_client.call_tool(name, arguments)
-
-        # Tool in whitelist but not currently available
-        all_tool_names = list(LOCAL_TOOLS.keys()) + [t.name for t in mcp_tools]
-        return json.dumps({
-            "status": "error",
-            "error_type": "tool_not_found",
-            "message": f"Tool '{name}' is not available right now.",
-            "available_tools": all_tool_names,
-        })
-
-    # ------------------------------------------------------------------
-    # Healing execution
-    # ------------------------------------------------------------------
-
-    async def _execute_tool(self, name: str, arguments: dict) -> str:
-        """Execute a tool with self-healing: retry, LLM param correction, fix memory."""
-        # --- Observability tracking ---
-        _known_fix_applied = False
-        _retries = 0
-        _healing_strategy: Optional[str] = None
-        _success = False
-        _error_type: Optional[str] = None
-        _output = ""
-        tool_span_id = await recorder.start_span("tool_call", name)
-        t0 = time.monotonic()
-
-        try:
-            mem_ns = self._mem()
-            original_arguments = dict(arguments)
-
-            # Step 1: Apply known fix from memory if available
-            fixed_args = lookup_known_fix(mem_ns, name, arguments)
-            if fixed_args is not None:
-                logger.info(f"[{self.name}] Applying known fix for '{name}': {arguments} → {fixed_args}")
-                arguments = fixed_args
-                _known_fix_applied = True
-
-            # Step 2: Execute and parse
-            raw = await self._raw_execute_tool(name, arguments)
-            result = parse_tool_result(raw)
-            record_metric(mem_ns, name, result.success, result.error_type)
-
-            if result.success:
-                _success, _output = True, result.content
-                return result.content
-
-            # Step 3: Determine healing strategy
-            strategy = get_strategy(result.error_type)
-            _error_type = result.error_type
-            logger.warning(
-                f"[{self.name}] Tool '{name}' failed "
-                f"(type={result.error_type}, strategy={strategy}): {result.content}"
-            )
-
-            # --- Strategy: retry (connection / timeout errors) ---
-            if strategy in ("retry", "retry_then_report"):
-                _healing_strategy = "retry"
-                for attempt in range(1, MAX_HEAL_RETRIES + 1):
-                    _retries += 1
-                    logger.info(f"[{self.name}] Retry {attempt}/{MAX_HEAL_RETRIES} for '{name}'")
-                    await asyncio.sleep(1.5 * attempt)
-                    raw = await self._raw_execute_tool(name, arguments)
-                    result = parse_tool_result(raw)
-                    record_metric(mem_ns, name, result.success, result.error_type)
-                    if result.success:
-                        _success, _output = True, result.content
-                        return result.content
-                _output = f"Tool '{name}' failed after {MAX_HEAL_RETRIES} retries: {result.content}"
-                return _output
-
-            # --- Strategy: llm_fix (validation errors) ---
-            if strategy == "llm_fix":
-                _healing_strategy = "llm_fix"
-                repair_prompt = build_repair_prompt(name, arguments, result)
-                logger.info(f"[{self.name}] Requesting LLM to fix params for '{name}'")
-                try:
-                    fix_response = await self.llm_client.chat.completions.create(
-                        model=self.model,
-                        messages=[{"role": "user", "content": repair_prompt}],
-                        temperature=0.0,
-                    )
-                    fix_text = fix_response.choices[0].message.content or ""
-                    new_args = parse_llm_fix(fix_text)
-
-                    if new_args and new_args != arguments:
-                        logger.info(f"[{self.name}] LLM suggested fix: {arguments} → {new_args}")
-                        raw = await self._raw_execute_tool(name, new_args)
-                        result = parse_tool_result(raw)
-                        record_metric(mem_ns, name, result.success, result.error_type)
-                        if result.success:
-                            record_fix(mem_ns, name, original_arguments, new_args)
-                            await recorder.upsert_tool_fix(
-                                self.name, name, original_arguments, new_args
-                            )
-                            _success, _output = True, result.content
-                            return result.content
-                        else:
-                            _output = f"Tool '{name}' still failed after LLM correction: {result.content}"
-                            return _output
-                    else:
-                        logger.warning(f"[{self.name}] LLM could not suggest a valid fix.")
-                except Exception as e:
-                    logger.error(f"[{self.name}] LLM fix call failed: {e}")
-
-            # --- Strategy: report ---
-            if result.error_type == "tool_not_found" and result.raw and isinstance(result.raw, dict):
-                avail = result.raw.get("available_tools", [])
-                if avail:
-                    _output = (
-                        f"Tool '{name}' does not exist. "
-                        f"Available tools: {', '.join(avail)}. "
-                        f"Please use one of the available tools instead."
-                    )
-                    return _output
-            _output = f"Tool '{name}' error ({result.error_type}): {result.content}"
-            return _output
-
-        finally:
-            duration_ms = int((time.monotonic() - t0) * 1000)
-            await recorder.record_tool_call(
-                span_id=tool_span_id,
-                tool_name=name,
-                tool_source=self._tool_source(name),
-                input_args=original_arguments if "original_arguments" in dir() else arguments,
-                output=_output,
-                success=_success,
-                error_type=_error_type,
-                healing_strategy=_healing_strategy,
-                retries=_retries,
-                known_fix_applied=_known_fix_applied,
-                duration_ms=duration_ms,
-            )
-            await recorder.complete_span(
-                tool_span_id,
-                "ok" if _success else "error",
-                duration_ms=duration_ms,
-            )
+        """Build the OpenAI function-calling tool list via the executor."""
+        return self.ctx.executor.build_tools(self.tool_names)
 
     # ------------------------------------------------------------------
     # ReAct loop
@@ -314,7 +100,24 @@ class BaseAgent:
 
     async def run(self, task: str) -> str:
         """Run the ReAct loop for a given task and return the final answer."""
-        # --- Observability: agent_run span ---
+        # Detect and persist user corrections before entering the ReAct loop
+        correction = _detect_correction(task)
+        if correction and self.ctx.last_tool_call:
+            ltc = self.ctx.last_tool_call
+            await recorder.record_correction(
+                raw_message=task,
+                agent_name=ltc.get("agent"),
+                tool_name=ltc.get("tool"),
+                wrong_value=correction["wrong_value"],
+                correct_value=correction["correct_value"],
+            )
+            logger.info(
+                f"[{self.name}] Correction detected — "
+                f"wrong={correction['wrong_value']!r}, "
+                f"correct={correction['correct_value']!r} "
+                f"(last tool: {ltc.get('tool')})"
+            )
+
         agent_span_id = await recorder.start_span("agent_run", self.name)
         parent_token = recorder.set_parent_span_id(agent_span_id)
         t_agent = time.monotonic()
@@ -342,10 +145,7 @@ class BaseAgent:
         tool_names = [t["function"]["name"] for t in tools]
         tool_list_str = ", ".join(f"`{n}`" for n in tool_names)
 
-        # Expose only user-facing memory to the LLM (exclude healing internals)
-        mem_ns = self._mem()
-        llm_memory = {k: v for k, v in mem_ns.items()
-                      if k not in ("tool_fixes", "tool_metrics")}
+        llm_memory = self.ctx.executor.get_agent_memory_for_llm(self.name)
 
         base_prompt = (
             f"You are '{self.name}', a specialised sub-agent of Open-Claudio.\n"
@@ -376,7 +176,7 @@ class BaseAgent:
             t_llm = time.monotonic()
             try:
                 kwargs = {
-                    "model": self.model,
+                    "model": self.ctx.model,
                     "messages": messages,
                     "temperature": 0.2,
                 }
@@ -384,7 +184,7 @@ class BaseAgent:
                     kwargs["tools"] = tools
                     kwargs["tool_choice"] = "auto"
 
-                response = await self.llm_client.chat.completions.create(**kwargs)
+                response = await self.ctx.llm_client.chat.completions.create(**kwargs)
                 llm_duration = int((time.monotonic() - t_llm) * 1000)
             except Exception as e:
                 llm_duration = int((time.monotonic() - t_llm) * 1000)
@@ -398,7 +198,7 @@ class BaseAgent:
 
             await recorder.record_llm_call(
                 span_id=llm_span_id,
-                model=self.model,
+                model=self.ctx.model,
                 messages=messages,
                 response=message.content or "",
                 tokens_prompt=usage.prompt_tokens if usage else None,
@@ -420,7 +220,7 @@ class BaseAgent:
                         args = {}
 
                     logger.info(f"[{self.name}] Tool call requested: {fn_name}({args})")
-                    observation = await self._execute_tool(fn_name, args)
+                    observation = await self.ctx.executor.execute(self.name, fn_name, args)
                     logger.info(f"[{self.name}] Tool result: {observation[:200]}...")
 
                     messages.append({
@@ -429,7 +229,6 @@ class BaseAgent:
                         "content": str(observation),
                     })
             else:
-                # No tool calls — LLM has produced a final answer
                 return message.content or ""
 
         return "Max reasoning steps reached without final answer."

@@ -59,8 +59,9 @@ class EventWorker:
         agent_label = route.agent or "planner"
         logger.info(f"[EventWorker] {event.source} → {agent_label} | task: '{task[:100]}...'")
 
-        # Create a trace for this event
-        trace_id = await recorder.start_trace(source=event.source, user_input=task)
+        # Create a trace for this event (propagate user_id if present in metadata)
+        user_id = event.metadata.get("user_id") if isinstance(event.metadata, dict) else None
+        trace_id = await recorder.start_trace(source=event.source, user_input=task, user_id=user_id)
         recorder.set_trace_id(trace_id) if trace_id else None
 
         status = "success"

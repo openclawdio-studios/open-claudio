@@ -11,6 +11,7 @@ interface Trace {
   ended_at: string | null
   input_text: string | null
   total_tokens: number | null
+  user: string | null
 }
 
 function statusVariant(s: string) {
@@ -46,6 +47,7 @@ export default function Traces() {
             <thead>
               <tr className="border-b border-gray-800 text-gray-500 text-xs uppercase">
                 <th className="px-6 py-3 text-left">ID</th>
+                <th className="px-4 py-3 text-left">User</th>
                 <th className="px-4 py-3 text-left">Source</th>
                 <th className="px-4 py-3 text-left">Status</th>
                 <th className="px-4 py-3 text-left">Input</th>
@@ -61,6 +63,9 @@ export default function Traces() {
                     <Link to={`/traces/${t.id}`} className="font-mono text-xs text-brand-400 hover:underline">
                       {t.id.slice(0, 8)}...
                     </Link>
+                  </td>
+                  <td className="px-4 py-3 text-xs text-gray-400 font-mono">
+                    {t.user ?? <span className="text-gray-700">—</span>}
                   </td>
                   <td className="px-4 py-3">
                     <Badge variant="blue">{t.source}</Badge>

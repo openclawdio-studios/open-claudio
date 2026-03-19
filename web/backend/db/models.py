@@ -33,6 +33,7 @@ class Trace(Base):
     duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    user_id: Mapped[Optional[UUID]] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
 
 
 class Span(Base):
@@ -124,3 +125,34 @@ class EventRecord(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     processing_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    username: Mapped[str] = mapped_column(String(50), unique=True)
+    display_name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id"))
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    key_prefix: Mapped[str] = mapped_column(String(13))
+    name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class TokenQuota(Base):
+    __tablename__ = "token_quotas"
+    user_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), ForeignKey("users.id"), primary_key=True)
+    daily_tokens: Mapped[int] = mapped_column(Integer, default=100000)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 from db.connection import AsyncSessionFactory
 from db.models import (
+    Correction,
     EventRecord,
     LLMCall,
     RagRetrieval,
@@ -131,7 +132,11 @@ def _serialize_messages(messages: list) -> list:
 # Traces
 # ---------------------------------------------------------------------------
 
-async def start_trace(source: str, user_input: str) -> Optional[uuid.UUID]:
+async def start_trace(
+    source: str,
+    user_input: str,
+    user_id: Optional[str] = None,
+) -> Optional[uuid.UUID]:
     """
     Create a new Trace row and store its ID in the context var.
     Returns the trace UUID, or None if recording is disabled.
@@ -139,10 +144,55 @@ async def start_trace(source: str, user_input: str) -> Optional[uuid.UUID]:
     if not _enabled:
         return None
     tid = uuid.uuid4()
-    trace = Trace(id=tid, source=source, user_input=user_input, status="running")
+    uid: Optional[uuid.UUID] = None
+    if user_id:
+        try:
+            uid = uuid.UUID(user_id)
+        except ValueError:
+            pass
+    trace = Trace(id=tid, source=source, user_input=user_input, status="running", user_id=uid)
     await _persist(trace)
     set_trace_id(tid)
     return tid
+
+
+async def check_user_quota(user_id: str) -> tuple[bool, int, int]:
+    """
+    Check whether a user is within their daily token quota.
+
+    Returns (allowed, tokens_used_today, daily_limit).
+    On any failure, returns (True, 0, -1) — allows the request through.
+    """
+    if not _enabled:
+        return True, 0, -1
+    try:
+        from sqlalchemy import text
+        async with AsyncSessionFactory() as session:
+            result = await session.execute(
+                text("""
+                    SELECT
+                        COALESCE(SUM(t.tokens_prompt_total + t.tokens_completion_total), 0) AS used,
+                        COALESCE(tq.daily_tokens, -1) AS lim
+                    FROM token_quotas tq
+                    LEFT JOIN traces t
+                        ON t.user_id = tq.user_id
+                        AND t.created_at::date = CURRENT_DATE
+                        AND t.status NOT IN ('running')
+                    WHERE tq.user_id = CAST(:uid AS uuid)
+                    GROUP BY tq.daily_tokens
+                """),
+                {"uid": user_id},
+            )
+            row = result.fetchone()
+            if row is None:
+                return True, 0, -1   # no quota record → allow
+            used, lim = int(row.used), int(row.lim)
+            if lim == -1:
+                return True, used, -1
+            return used < lim, used, lim
+    except Exception as exc:
+        logger.warning("check_user_quota failed for %s: %s", user_id, exc)
+        return True, 0, -1   # allow on DB failure
 
 
 async def complete_trace(
@@ -404,6 +454,30 @@ async def record_event(
     )
     await _persist(row)
     return eid
+
+
+async def record_correction(
+    raw_message: str,
+    agent_name: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    wrong_value: Optional[str] = None,
+    correct_value: Optional[str] = None,
+) -> None:
+    """
+    Persist a user correction detected in a message.
+    Linked to the current trace_id if available.
+    """
+    if not _enabled:
+        return
+    row = Correction(
+        trace_id=get_trace_id(),
+        agent_name=agent_name,
+        tool_name=tool_name,
+        wrong_value=wrong_value,
+        correct_value=correct_value,
+        raw_message=raw_message[:2000],
+    )
+    await _persist(row)
 
 
 async def complete_event(

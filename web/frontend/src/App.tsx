@@ -7,6 +7,7 @@ import Analytics from './pages/Analytics'
 import KnowledgeBase from './pages/KnowledgeBase'
 import Events from './pages/Events'
 import Tools from './pages/Tools'
+import Users from './pages/Users'
 
 export default function App() {
   return (
@@ -20,6 +21,7 @@ export default function App() {
         <Route path="/knowledge" element={<KnowledgeBase />} />
         <Route path="/events" element={<Events />} />
         <Route path="/tools" element={<Tools />} />
+        <Route path="/users" element={<Users />} />
       </Routes>
     </Layout>
   )
