@@ -20,6 +20,37 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("PlannerAgent")
 
+_GOAL_PLANNER_PROMPT_TEMPLATE = """\
+You are the Planner for Open-Claudio, an AI home automation system working toward an autonomous goal.
+
+Your job is to decompose the goal into a list of concrete sub-tasks that will move the system
+from its CURRENT STATE to the DESIRED STATE.
+
+Available agents and their capabilities:
+{agent_list}
+
+Goal description: {description}
+
+Current state (what we know right now):
+{current_state}
+
+Desired state (what we need to achieve):
+{desired_state}
+
+OUTPUT RULES — follow them exactly:
+1. Output ONLY a valid JSON array. No markdown fences, no explanation, no preamble.
+2. Each element must be an object with these keys:
+   - "id"         : unique step identifier, e.g. "s0", "s1"
+   - "agent"      : name of the specialist agent
+   - "task"       : specific sub-task description
+   - "reason"     : one-line explanation of why this step is needed
+   - "priority"   : integer (1=highest)
+   - "depends_on" : list of step IDs this step requires first ([] if independent)
+3. Only include steps for state keys that are NOT already satisfied.
+4. Steps with empty "depends_on" run IN PARALLEL — maximise parallelism.
+5. If the desired state is already achieved, output an empty array: []
+"""
+
 _PLANNER_PROMPT_TEMPLATE = """\
 You are the Planner for Open-Claudio, an AI home automation system.
 
@@ -331,6 +362,100 @@ class PlannerAgent:
                 pending.remove(step)
 
         return results
+
+    # ------------------------------------------------------------------
+    # Goal-oriented planning
+    # ------------------------------------------------------------------
+
+    async def plan_from_goal(self, goal) -> List[dict]:
+        """
+        Decompose a Goal into a DAG of steps, using current ctx.state as
+        the baseline and goal.desired_state as the target.
+
+        Returns normalized steps (same format as plan()).
+        """
+        current_state = self.ctx.state or {}
+
+        # Filter: only include desired keys not yet satisfied
+        unsatisfied = {
+            k: v for k, v in goal.desired_state.items()
+            if current_state.get(k) != v
+        }
+
+        if not unsatisfied:
+            logger.info(f"PlannerAgent.plan_from_goal: goal '{goal.id}' already satisfied.")
+            return []
+
+        current_state_str = (
+            "\n".join(f"  {k}: {v}" for k, v in current_state.items())
+            or "  (no state data available yet)"
+        )
+        desired_state_str = "\n".join(f"  {k}: {v}" for k, v in unsatisfied.items())
+
+        prompt = _GOAL_PLANNER_PROMPT_TEMPLATE.format(
+            agent_list="\n".join(
+                f'- "{name}" [{", ".join(getattr(a, "capabilities", []) or ["general"])}]'
+                for name, a in self.agents.items()
+            ),
+            description=goal.description,
+            current_state=current_state_str,
+            desired_state=desired_state_str,
+        )
+
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": f"Plan steps to satisfy goal: {goal.description}"},
+        ]
+
+        span_id = await recorder.start_span("planner", f"goal:{goal.id}")
+        t0 = time.monotonic()
+        try:
+            response = await self.ctx.llm_client.chat.completions.create(
+                model=self.ctx.model,
+                messages=messages,
+                temperature=0.0,
+            )
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            usage = response.usage
+            await recorder.record_llm_call(
+                span_id=span_id,
+                model=self.ctx.model,
+                messages=messages,
+                response=(response.choices[0].message.content or ""),
+                tokens_prompt=usage.prompt_tokens if usage else None,
+                tokens_completion=usage.completion_tokens if usage else None,
+                temperature=0.0,
+                stop_reason="stop",
+                duration_ms=duration_ms,
+            )
+            raw = (response.choices[0].message.content or "").strip()
+
+            if raw.startswith("```"):
+                lines = raw.split("\n")
+                lines = [l for l in lines if not l.strip().startswith("```")]
+                raw = "\n".join(lines).strip()
+
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                steps = self._normalize_steps(parsed)
+                logger.info(
+                    f"PlannerAgent.plan_from_goal '{goal.id}': {len(steps)} step(s)"
+                )
+                await recorder.complete_span(span_id, "ok")
+                return steps
+
+            await recorder.complete_span(span_id, "error", "unexpected structure")
+        except json.JSONDecodeError as e:
+            logger.warning(f"PlannerAgent.plan_from_goal JSON parse error: {e}")
+            await recorder.complete_span(span_id, "error", str(e))
+        except Exception as e:
+            logger.error(f"PlannerAgent.plan_from_goal failed: {e}")
+            await recorder.complete_span(span_id, "error", str(e))
+
+        # Fallback: treat goal description as a plain task
+        fallback = self._normalize_steps([{"agent": "utility", "task": goal.description}])
+        logger.info(f"PlannerAgent.plan_from_goal falling back to: {fallback}")
+        return fallback
 
     # ------------------------------------------------------------------
     # Entry point

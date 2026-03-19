@@ -16,6 +16,8 @@ from agents.utility_agent import make_utility_agent
 from agents.knowledge_agent import make_knowledge_agent
 from agents.planner_agent import PlannerAgent
 from event_worker import EventWorker
+from goal import GoalStore
+from goal_engine import GoalEngine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("OpenClaudio")
@@ -44,6 +46,8 @@ class OpenClaudio:
         self.ctx: AgentContext = None
         self.planner: PlannerAgent = None
         self.agents: dict = {}
+        self.goal_store: GoalStore = None
+        self.goal_engine: GoalEngine = None
 
     async def initialize(self):
         """Connect to all MCP servers, build AgentContext, instantiate agents."""
@@ -81,6 +85,13 @@ class OpenClaudio:
             "knowledge": make_knowledge_agent(self.ctx),
         }
         self.planner = PlannerAgent(agents=self.agents, ctx=self.ctx)
+
+        logger.info("Loading GoalStore...")
+        self.goal_store = GoalStore()
+        self.goal_store.load()
+        _seed_startup_goals(self.goal_store)
+
+        self.goal_engine = GoalEngine(goal_store=self.goal_store, ctx=self.ctx)
         logger.info("OpenClaudio initialized. Agents: %s", list(self.agents.keys()))
 
     async def process(self, user_input: str, source: str = "cli") -> str:
@@ -109,10 +120,31 @@ class OpenClaudio:
 
     async def shutdown(self):
         """Disconnect from MCP servers and persist context scratchpad."""
+        if self.goal_engine:
+            self.goal_engine.stop()
+        if self.goal_store:
+            self.goal_store.save()
         await self.mcp_client.disconnect()
         if self.ctx:
             self.ctx.save()
         logger.info("OpenClaudio shut down. Context saved.")
+
+
+def _seed_startup_goals(goal_store: GoalStore) -> None:
+    """Add hardcoded goals that should always be active if not already present."""
+    from goal import GoalStore as _GS
+    if not goal_store.get("secure_house"):
+        from goal import Goal, GOAL_TYPE_REACTIVE, STATUS_PENDING
+        goal = Goal(
+            id="secure_house",
+            description="Keep the house secure: door locked and blinds closed",
+            goal_type=GOAL_TYPE_REACTIVE,
+            priority=2.0,
+            status=STATUS_PENDING,
+            desired_state={"door.main": "locked", "blinds.all": "closed"},
+        )
+        goal_store.add(goal)
+        logger.info("GoalStore: seeded hardcoded goal 'secure_house'")
 
 
 def _build_event_tasks(oc: OpenClaudio) -> list:
@@ -120,8 +152,11 @@ def _build_event_tasks(oc: OpenClaudio) -> list:
     tasks = []
 
     # EventWorker always runs
-    worker = EventWorker(planner=oc.planner, agents=oc.agents)
+    worker = EventWorker(planner=oc.planner, agents=oc.agents, goal_store=oc.goal_store)
     tasks.append(worker.run())
+
+    # GoalEngine always runs
+    tasks.append(oc.goal_engine.run())
 
     # MQTT source — enabled only if MQTT_ENABLED=true (MQTT_HOST is config, not a feature flag)
     if os.getenv("MQTT_ENABLED", "").lower() == "true":

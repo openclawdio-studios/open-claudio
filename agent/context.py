@@ -58,6 +58,11 @@ class AgentContext:
     history: List[Dict] = field(default_factory=list)
     events: List[Any] = field(default_factory=list)
 
+    # Event-driven state cache — updated by events, read by GoalEngine
+    # Keys use "device.location" format (e.g. "blinds.salon", "door.main")
+    # Not persisted: rebuilt from incoming events on each restart.
+    state: Dict[str, Any] = field(default_factory=dict)
+
     # Transient — last successful tool call this session (for correction detection)
     last_tool_call: Optional[Dict[str, Any]] = field(default=None)
 
